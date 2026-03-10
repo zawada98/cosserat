@@ -8,7 +8,9 @@
   "ExpandedNodes": [
     "",
     "\\src",
-    "\\src\\Cosserat"
+    "\\src\\Cosserat",
+    "\\src\\Cosserat\\mapping"
   ],
+  "SelectedNode": "\\src\\Cosserat\\mapping\\DiscreteCosseratMapping.cpp",
   "PreviewInSolutionExplorer": false
 }

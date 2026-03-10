@@ -140,7 +140,7 @@ class Cosserat(Sofa.Prefab):
         # @todo converter
         positions = [list(pos) for pos in self.position.value]
 
-        rigidBaseNode.addObject('MechanicalObject', template='Rigid3d', name="RigidBaseMO", showObjectScale=0.2,
+        rigidBaseNode.addObject('MechanicalObject', template='Rigid3dRigid3d', name="RigidBaseMO", showObjectScale=0.2,
                                 translation=trans, position=positions, rotation=rot,
                                 showObject=int(self.showObject.value))
 

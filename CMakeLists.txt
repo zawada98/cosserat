@@ -50,6 +50,7 @@ set(HEADER_FILES
     ${SRC_ROOT_DIR}/mapping/LegendrePolynomialsMapping.inl
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.h
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.inl
+    ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.h
     )
 set(SOURCE_FILES
     ${SRC_ROOT_DIR}/initCosserat.cpp
@@ -66,6 +67,7 @@ set(SOURCE_FILES
     ${SRC_ROOT_DIR}/constraint/CosseratSlidingConstraint.cpp
     ${SRC_ROOT_DIR}/mapping/LegendrePolynomialsMapping.cpp
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.cpp
+    ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.cpp
     )
 
 

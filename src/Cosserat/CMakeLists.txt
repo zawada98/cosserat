@@ -36,6 +36,8 @@ set(HEADER_FILES
     constraint/QPSlidingConstraint.inl
     constraint/CosseratNeedleSlidingConstraint.h
     constraint/CosseratNeedleSlidingConstraint.inl
+
+    intersection/SphereSweptIntersectionMethod.h
     )
 
 set(SOURCE_FILES
@@ -58,6 +60,8 @@ set(SOURCE_FILES
     constraint/CosseratSlidingConstraint.cpp
     constraint/QPSlidingConstraint.cpp
     constraint/CosseratNeedleSlidingConstraint.cpp
+
+    intersection/SphereSweptIntersectionMethod.cpp
     )
 
 # add_subdirectory(Binding)
