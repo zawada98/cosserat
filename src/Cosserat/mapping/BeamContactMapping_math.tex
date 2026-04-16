@@ -1,0 +1,502 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{bm}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{parskip}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\vv}[1]{\bm{#1}}
+\newcommand{\nn}{\hat{\vv{n}}}
+\newcommand{\cross}[2]{#1 \times #2}
+\newcommand{\norm}[1]{\left\|#1\right\|}
+
+\title{\textbf{BeamContactMapping: Mathematical Formulation}\\
+       \large Cosserat Plugin -- SOFA Framework}
+\author{Cosserat Plugin Documentation}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Overview}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\texttt{BeamContactMapping} is a \texttt{Multi2Mapping} that receives the
+contact-pair descriptors produced by \texttt{SphereSweptIntersectionMethod}
+(SSIM) and converts them into concrete contact-point positions in world space.
+It also computes the Jacobian relating frame velocities to contact-point
+velocities, which is required by the constraint solver.
+
+\textbf{Inputs}
+\begin{itemize}
+  \item Beam~1 rigid frames: $\{\vv{p}^{(1)}_k, \vv{R}^{(1)}_k\}_{k=0}^{N_1-1}$
+        (output of \texttt{DiscreteCosseratMapping}).
+  \item Beam~2 rigid frames: $\{\vv{p}^{(2)}_k, \vv{R}^{(2)}_k\}_{k=0}^{N_2-1}$.
+  \item Per-contact section indices $\{i, j\}$ and curvilinear parameters
+        $\{\alpha, \beta\} \in [0,1]^2$ from SSIM.
+  \item Beam radii $r_1, r_2 > 0$.
+\end{itemize}
+
+\textbf{Outputs} (for $K$ active contact pairs)
+\begin{itemize}
+  \item $2K$ contact-point positions in $\mathbb{R}^3$:
+        index $2k$ is the Beam~1 surface point $\vv{P}^c_A$,
+        index $2k+1$ is the Beam~2 surface point $\vv{P}^c_B$.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{SSIM Output: What the Mapping Receives}
+% ─────────────────────────────────────────────────────────────────────────────
+
+For contact pair $k$, SSIM provides the scalar parameters
+$(\alpha, \beta) \in [0,1]^2$ that minimise the surface-to-surface gap.
+
+\subsection{ALGO\_1 -- Segment-to-Segment}
+
+$\{i,j\}$ are segment indices.
+The closest point on Beam~1 is located at parameter $\alpha$ on the
+segment $[\vv{p}^{(1)}_i,\, \vv{p}^{(1)}_{i+1}]$, and the closest
+point on Beam~2 at parameter $\beta$ on $[\vv{p}^{(2)}_j,\, \vv{p}^{(2)}_{j+1}]$.
+
+\subsection{ALGO\_2 -- Node-to-Segment}
+
+$i$ is a node index (not a segment index), $j$ is still a segment index.
+The Beam~1 contact is located exactly at node $\vv{p}^{(1)}_i$, so
+$\alpha = 0$ by construction.
+The Beam~2 contact is at parameter $\beta$ on
+$[\vv{p}^{(2)}_j,\, \vv{p}^{(2)}_{j+1}]$.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Forward Map: Contact-Point Positions (\texttt{apply})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Centreline Interpolation}
+
+\textbf{ALGO\_1}
+\begin{align}
+  \vv{P}_A &= (1-\alpha)\,\vv{p}^{(1)}_i + \alpha\,\vv{p}^{(1)}_{i+1},
+  \label{eq:PA_algo1}\\
+  \vv{P}_B &= (1-\beta)\,\vv{p}^{(2)}_j + \beta\,\vv{p}^{(2)}_{j+1}.
+  \label{eq:PB}
+\end{align}
+
+\textbf{ALGO\_2}
+\begin{align}
+  \vv{P}_A &= \vv{p}^{(1)}_i
+  \quad (\text{no interpolation; }{\alpha = 0}),
+  \label{eq:PA_algo2}\\
+  \vv{P}_B &= (1-\beta)\,\vv{p}^{(2)}_j + \beta\,\vv{p}^{(2)}_{j+1}.
+  \label{eq:PB_algo2}
+\end{align}
+
+\subsection{Contact Normal}
+
+\begin{equation}
+  \nn = \frac{\vv{P}_A - \vv{P}_B}{\norm{\vv{P}_A - \vv{P}_B}}.
+  \label{eq:normal}
+\end{equation}
+
+The normal points from Beam~2 centreline toward Beam~1 centreline.
+If $\norm{\vv{P}_A - \vv{P}_B} < \varepsilon$ (coincident centrelines),
+a fall-back direction is taken from the local $Y$-axis of frame $i$ of Beam~1.
+
+\subsection{Surface Contact Points}
+
+\begin{align}
+  \vv{P}^c_A &= \vv{P}_A - r_1\,\nn
+  && \rightarrow \text{output}[2k],
+  \label{eq:PcA}\\
+  \vv{P}^c_B &= \vv{P}_B + r_2\,\nn
+  && \rightarrow \text{output}[2k+1].
+  \label{eq:PcB}
+\end{align}
+
+The gap (signed distance between the two surfaces along $\nn$) is
+\begin{equation}
+  g = \nn \cdot (\vv{P}^c_B - \vv{P}^c_A)
+    = \norm{\vv{P}_A - \vv{P}_B} - (r_1 + r_2).
+  \label{eq:gap}
+\end{equation}
+
+Contact is active when $g \leq 0$.
+
+\subsection{Radial Moment Arms}
+
+Define the moment arm of each contact point relative to its interpolated
+centreline point:
+\begin{equation}
+  \vv{a}_A = \vv{P}^c_A - \vv{P}_A = -r_1\,\nn,
+  \qquad
+  \vv{a}_B = \vv{P}^c_B - \vv{P}_B = +r_2\,\nn.
+  \label{eq:arms}
+\end{equation}
+
+A key property used in the Jacobian derivation (Section~\ref{sec:jacobian})
+is that $\vv{a}_A$ and $\vv{a}_B$ are the \emph{same} vector for all
+frames contributing to the same contact point, because the SLERP
+linearisation collapses per-frame moment variations into a single radial term.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Tangent Map: Velocity Jacobian (\texttt{applyJ})}
+\label{sec:jacobian}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Rigid-Frame Velocity Representation}
+
+Each Cosserat beam frame carries a $6$-DOF velocity:
+$\vv{d}_k = (\vv{v}_k,\, \bm{\omega}_k)$
+where $\vv{v}_k \in \mathbb{R}^3$ is the linear velocity and
+$\bm{\omega}_k \in \mathbb{R}^3$ is the angular velocity of frame $k$.
+
+The velocity of any point $\vv{q}$ rigidly attached to frame $k$ is
+\begin{equation}
+  \dot{\vv{q}} = \vv{v}_k + \bm{\omega}_k \times (\vv{q} - \vv{p}_k).
+  \label{eq:rigid_vel}
+\end{equation}
+
+\subsection{Velocity of the Centreline Contact Point}
+
+Differentiating the linear interpolation \eqref{eq:PA_algo1}
+and applying the SLERP linearisation (angular velocity interpolates
+linearly to first order in $\alpha$):
+
+\begin{equation}
+  \dot{\vv{P}}_A = (1-\alpha)\,\vv{v}_i + \alpha\,\vv{v}_{i+1}
+  \quad \text{(ALGO\_1)}.
+  \label{eq:Pdot_A}
+\end{equation}
+
+For ALGO\_2 ($\alpha = 0$):
+\begin{equation}
+  \dot{\vv{P}}_A = \vv{v}_i.
+  \label{eq:Pdot_A2}
+\end{equation}
+
+\subsection{Velocity of the Surface Contact Point}
+
+Differentiating \eqref{eq:PcA} with the contact normal $\nn$ frozen
+at the current configuration:
+
+\begin{align}
+  \dot{\vv{P}}^c_A
+  &= \dot{\vv{P}}_A - r_1\,\dot{\nn}
+  \;\approx\; \dot{\vv{P}}_A + r_1\,\bigl[(1-\alpha)\,\bm{\omega}_i
+              + \alpha\,\bm{\omega}_{i+1}\bigr] \times \nn.
+  \label{eq:PcAdot_intermediate}
+\end{align}
+
+Factoring by frame:
+\begin{equation}
+  \boxed{
+  \dot{\vv{P}}^c_A
+  = \sum_{b \in \mathcal{B}_1(k)}
+    w_b\,\bigl[\vv{v}_b + \bm{\omega}_b \times \vv{a}_A\bigr],
+  }
+  \label{eq:PcAdot}
+\end{equation}
+
+where $\mathcal{B}_1(k)$ and the weights $w_b$ are defined in
+Table~\ref{tab:blocks}, and $\vv{a}_A = -r_1\,\nn$.
+
+Similarly for Beam~2:
+\begin{equation}
+  \boxed{
+  \dot{\vv{P}}^c_B
+  = \sum_{b \in \mathcal{B}_2(k)}
+    w_b\,\bigl[\vv{v}_b + \bm{\omega}_b \times \vv{a}_B\bigr],
+  }
+  \label{eq:PcBdot}
+\end{equation}
+
+with $\mathcal{B}_2(k)$ and $\vv{a}_B = +r_2\,\nn$.
+
+\begin{table}[h]
+\centering
+\caption{Jacobian block sets for contact pair $k$.}
+\label{tab:blocks}
+\begin{tabular}{lllll}
+\toprule
+Algorithm & Surface pt & Block set & Frame index & Weight \\
+\midrule
+ALGO\_1 & $\vv{P}^c_A$ & $\mathcal{B}_1(k)$ & $i$   & $(1-\alpha)$ \\
+        &               &                     & $i+1$ & $\alpha$ \\
+\addlinespace
+ALGO\_2 & $\vv{P}^c_A$ & $\mathcal{B}_1(k)$ & $i$ only & $1$ \\
+\midrule
+Both    & $\vv{P}^c_B$ & $\mathcal{B}_2(k)$ & $j$   & $(1-\beta)$ \\
+        &               &                     & $j+1$ & $\beta$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Compact Jacobian Notation}
+
+Stack the frame velocities of Beam~1 into $\dot{\vv{q}}_1 \in \mathbb{R}^{6N_1}$
+and Beam~2 into $\dot{\vv{q}}_2 \in \mathbb{R}^{6N_2}$.
+The contact-point velocity $\dot{\vv{s}}_k \in \mathbb{R}^3$ at output DOF $2k$
+satisfies
+
+\begin{equation}
+  \dot{\vv{s}}_k = J^{(1)}_k\,\dot{\vv{q}}_1,
+  \qquad
+  J^{(1)}_k \in \mathbb{R}^{3 \times 6N_1},
+  \label{eq:J1}
+\end{equation}
+
+where the only non-zero $3\times 6$ blocks of $J^{(1)}_k$ are
+\begin{equation}
+  \left[J^{(1)}_k\right]_{\cdot,b}
+  = w_b\,\bigl[\,I_{3\times 3}\;\Big|\; -[\vv{a}_A]_\times\,\bigr],
+  \qquad b \in \mathcal{B}_1(k),
+  \label{eq:Jblock1}
+\end{equation}
+
+with $[\vv{a}_A]_\times$ the skew-symmetric matrix associated with
+$\vv{a}_A$ (so that $[\vv{a}_A]_\times\,\bm{\omega} = \vv{a}_A \times \bm{\omega}$).
+
+Analogously, for output DOF $2k+1$:
+\begin{equation}
+  \left[J^{(2)}_k\right]_{\cdot,b}
+  = w_b\,\bigl[\,I_{3\times 3}\;\Big|\; -[\vv{a}_B]_\times\,\bigr],
+  \qquad b \in \mathcal{B}_2(k).
+  \label{eq:Jblock2}
+\end{equation}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Transpose Map: Force Back-Propagation (\texttt{applyJT})}
+\label{sec:applyJT}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Virtual Work Principle}
+
+By the principle of virtual work, a contact force $\vv{F}$ applied at
+$\vv{P}^c_A$ is dual to the velocity $\dot{\vv{P}}^c_A$:
+\begin{equation}
+  \delta W = \vv{F} \cdot \delta\vv{P}^c_A
+           = \sum_{b \in \mathcal{B}_1(k)}
+             w_b\,\vv{F} \cdot \bigl[\delta\vv{p}_b
+             + \delta\bm{\theta}_b \times \vv{a}_A\bigr].
+  \label{eq:virtualwork}
+\end{equation}
+
+Identifying the conjugate generalised forces:
+
+\begin{equation}
+  \boxed{
+  \vv{f}_b \mathrel{+}= w_b\,\vv{F},
+  \qquad
+  \bm{\tau}_b \mathrel{+}= w_b\,(\vv{a}_A \times \vv{F}),
+  \qquad b \in \mathcal{B}_1(k).
+  }
+  \label{eq:Jt1}
+\end{equation}
+
+For Beam~2, a force $\vv{F}'$ at $\vv{P}^c_B$ gives:
+\begin{equation}
+  \boxed{
+  \vv{f}_b \mathrel{+}= w_b\,\vv{F}',
+  \qquad
+  \bm{\tau}_b \mathrel{+}= w_b\,(\vv{a}_B \times \vv{F}'),
+  \qquad b \in \mathcal{B}_2(k).
+  }
+  \label{eq:Jt2}
+\end{equation}
+
+\subsection{Normal vs.\ Tangential Forces}
+
+\paragraph{Normal contact force.}
+$\vv{F} = \lambda\,\nn$ for some $\lambda \geq 0$:
+\begin{equation}
+  \bm{\tau}_b
+  = w_b\,(\vv{a}_A \times \lambda\,\nn)
+  = w_b\,(-r_1\,\nn) \times (\lambda\,\nn)
+  = -w_b\,r_1\,\lambda\,(\nn \times \nn)
+  = \vv{0}.
+  \label{eq:normal_torque}
+\end{equation}
+A pure normal force produces \emph{no torque} on any frame.
+Physically: the force is directed along the line connecting the
+frame centre to the contact point, so its moment arm is zero.
+
+\paragraph{Tangential (friction) force.}
+Let $\hat{\vv{t}} \perp \nn$ be a tangential direction.
+$\vv{F} = \lambda_t\,\hat{\vv{t}}$:
+\begin{equation}
+  \bm{\tau}_b
+  = w_b\,(-r_1\,\nn) \times (\lambda_t\,\hat{\vv{t}})
+  = -w_b\,r_1\,\lambda_t\,(\nn \times \hat{\vv{t}})
+  \neq \vv{0}.
+  \label{eq:tangential_torque}
+\end{equation}
+A tangential force generates a rolling/twisting torque on the frames.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Constraint Jacobian (\texttt{applyJT} MatrixDeriv)}
+\label{sec:constraint}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Role in the Constraint Solver}
+
+\texttt{GenericConstraintSolver} (under \texttt{FreeMotionAnimationLoop})
+assembles a constraint Jacobian $H$ by calling \texttt{applyJT} on each
+mapping in the scene graph. Each \emph{constraint} corresponds to one
+scalar condition $g(\vv{q}) = 0$, evaluated along a direction
+$\vv{d} \in \mathbb{R}^3$ at a specific contact point.
+
+A row $r$ of the output constraint matrix encodes:
+\begin{equation}
+  [\text{OutMatrixDeriv}]_{r,\,\text{outDOF}}
+  = \vv{d} \in \mathbb{R}^3.
+  \label{eq:out_constraint_row}
+\end{equation}
+
+For the normal contact constraint, $\vv{d} = \nn$ and
+$\text{outDOF} \in \{2k,\, 2k+1\}$ corresponds to one of the two
+surface points of pair $k$.
+
+\subsection{Mapping to Input Space}
+
+The corresponding contribution to the input (frame) constraint matrix is:
+
+For $\text{outDOF} = 2k$ (Beam-1 surface point, blocks $b \in \mathcal{B}_1(k)$):
+\begin{equation}
+  [\text{In1MatrixDeriv}]_{r,\, b.\text{frameIdx}}
+  \mathrel{+}=
+  \begin{pmatrix} w_b\,\vv{d} \\ w_b\,(\vv{a}_A \times \vv{d}) \end{pmatrix}
+  \in \mathbb{R}^6.
+  \label{eq:in1_constraint}
+\end{equation}
+
+For $\text{outDOF} = 2k+1$ (Beam-2 surface point, blocks $b \in \mathcal{B}_2(k)$):
+\begin{equation}
+  [\text{In2MatrixDeriv}]_{r,\, b.\text{frameIdx}}
+  \mathrel{+}=
+  \begin{pmatrix} w_b\,\vv{d} \\ w_b\,(\vv{a}_B \times \vv{d}) \end{pmatrix}
+  \in \mathbb{R}^6.
+  \label{eq:in2_constraint}
+\end{equation}
+
+\subsection{Normal Constraint Row (Explicit Form)}
+
+The gap rate for contact $k$ along $\nn$ is
+\begin{equation}
+  \dot{g} = \nn \cdot (\dot{\vv{P}}^c_B - \dot{\vv{P}}^c_A).
+  \label{eq:gdot}
+\end{equation}
+
+Substituting \eqref{eq:PcAdot}--\eqref{eq:PcBdot}:
+
+\begin{align}
+  \dot{g}
+  &= \nn \cdot \Biggl[
+    \sum_{b \in \mathcal{B}_2(k)} w_b\,(\vv{v}_b + \bm{\omega}_b \times \vv{a}_B)
+    -
+    \sum_{b \in \mathcal{B}_1(k)} w_b\,(\vv{v}_b + \bm{\omega}_b \times \vv{a}_A)
+  \Biggr].
+  \label{eq:gdot_expanded}
+\end{align}
+
+Using $\nn \cdot (\bm{\omega} \times (-r_1\nn)) = -r_1\,\nn\cdot(\bm{\omega}\times\nn) = 0$
+(the scalar triple product $[\nn,\,\nn,\,\bm{\omega}] = 0$), the
+angular-velocity contributions to the \emph{normal} constraint vanish:
+
+\begin{equation}
+  \dot{g}
+  = \sum_{b \in \mathcal{B}_2(k)} w_b\,\nn \cdot \vv{v}_b
+  - \sum_{b \in \mathcal{B}_1(k)} w_b\,\nn \cdot \vv{v}_b,
+  \label{eq:gdot_normal_simplified}
+\end{equation}
+
+confirming that the $6$-DOF Jacobian blocks for the normal constraint
+reduce to:
+\begin{equation}
+  \bigl[J^{(1)}_k\bigr]_{\text{normal},\, b}
+  = \bigl[(1-\alpha)\,\nn^T\;\big|\;\vv{0}_{1\times 3}\bigr],
+  \quad
+  \bigl[J^{(2)}_k\bigr]_{\text{normal},\, b}
+  = \bigl[(1-\beta)\,\nn^T\;\big|\;\vv{0}_{1\times 3}\bigr].
+  \label{eq:normal_Jblocks}
+\end{equation}
+
+\subsection{Tangential Constraint Row (Explicit Form)}
+
+For a tangential direction $\hat{\vv{t}} \perp \nn$, the angular-velocity
+terms do not cancel. Using the cyclic identity
+$\hat{\vv{t}} \cdot (\bm{\omega} \times \vv{a}) = \bm{\omega} \cdot (\vv{a} \times \hat{\vv{t}})$:
+
+\begin{equation}
+  \bigl[J^{(1)}_k\bigr]_{\text{tan},\, b}
+  = w_b\,\bigl[\hat{\vv{t}}^T\;\big|\; (\vv{a}_A \times \hat{\vv{t}})^T\bigr]
+  = w_b\,\bigl[\hat{\vv{t}}^T\;\big|\; (-r_1\,\nn \times \hat{\vv{t}})^T\bigr].
+  \label{eq:tangential_Jblocks}
+\end{equation}
+
+The rotational block $-r_1\,(\nn \times \hat{\vv{t}})$ is the moment-arm
+coupling that links frame rotation to tangential slip.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{ALGO\_1 vs.\ ALGO\_2: Summary of Differences}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{table}[h]
+\centering
+\caption{Key differences between ALGO\_1 and ALGO\_2.}
+\label{tab:algo_diff}
+\begin{tabular}{lll}
+\toprule
+Property & ALGO\_1 (segment-to-segment) & ALGO\_2 (node-to-segment) \\
+\midrule
+Index $i$ & Beam-1 \emph{segment} index & Beam-1 \emph{node} index \\
+Parameter $\alpha$ & $\in (0,1)$ in general & $= 0$ always \\
+Beam-1 blocks per contact & 2 (frames $i$ and $i+1$) & 1 (frame $i$ only) \\
+Weights on Beam-1 & $(1-\alpha)$, $\alpha$ & $1$ \\
+Beam-2 blocks per contact & \multicolumn{2}{c}{2 (frames $j$ and $j+1$), weights $(1-\beta)$ and $\beta$} \\
+Output positions per contact & \multicolumn{2}{c}{2 (Pc\_A at $2k$, Pc\_B at $2k+1$)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ALGO\_2 can be seen as the degenerate limit of ALGO\_1 with $\alpha = 0$:
+the weight of frame $i+1$ vanishes, and the mapping needs only one Beam-1
+Jacobian block. The same formulae \eqref{eq:PcAdot}--\eqref{eq:Jt2}
+apply in both cases without special-casing -- only the block set
+$\mathcal{B}_1(k)$ and the interpretation of the index $i$ differ.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Symbol Glossary}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{tabular}{ll}
+\toprule
+Symbol & Meaning \\
+\midrule
+$\vv{p}^{(m)}_k$ & Position of frame $k$ on Beam $m$ \\
+$\vv{R}^{(m)}_k$ & Orientation (rotation matrix) of frame $k$ on Beam $m$ \\
+$N_m$            & Number of frames on Beam $m$ \\
+$i$              & Beam-1 segment index (ALGO\_1) or node index (ALGO\_2) \\
+$j$              & Beam-2 segment index \\
+$\alpha,\beta$   & Curvilinear parameters $\in [0,1]$ from SSIM \\
+$r_1,r_2$        & Cross-section radii of Beam~1 and Beam~2 \\
+$\vv{P}_A, \vv{P}_B$ & Interpolated centreline contact points \\
+$\nn$            & Unit contact normal (Beam-2 $\to$ Beam-1) \\
+$\vv{P}^c_A, \vv{P}^c_B$ & Surface contact points \\
+$g$              & Signed gap ($= 0$ at first contact, $< 0$ in penetration) \\
+$\vv{a}_A, \vv{a}_B$ & Radial moment arms: $-r_1\nn$ and $+r_2\nn$ \\
+$\vv{v}_k, \bm{\omega}_k$ & Linear and angular velocities of frame $k$ \\
+$w_b$            & Interpolation weight of Jacobian block $b$ \\
+$\vv{F}$         & Contact force vector \\
+$\vv{f}_b, \bm{\tau}_b$ & Generalised force and torque accumulated on frame $b$ \\
+$K$              & Number of active contact pairs \\
+$\varepsilon$    & Numerical zero threshold ($10^{-14}$) \\
+\bottomrule
+\end{tabular}
+
+\end{document}

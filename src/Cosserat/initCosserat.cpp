@@ -54,6 +54,9 @@ extern void registerDiscretDynamicCosseratMapping(sofa::core::ObjectFactory* fac
 extern void registerLegendrePolynomialsMapping(sofa::core::ObjectFactory* factory);
 extern void registerRigidDistanceMapping(sofa::core::ObjectFactory* factory);
 extern void registerSphereSweptIntersectionMethod(sofa::core::ObjectFactory* factory);
+extern void registerContactFeeder(sofa::core::ObjectFactory* factory);
+extern void registerBeamContactMapping(sofa::core::ObjectFactory* factory);
+
 
 extern "C" {
 SOFA_COSSERAT_API void initExternalModule();
@@ -106,6 +109,8 @@ void registerObjects(sofa::core::ObjectFactory* factory)
   registerLegendrePolynomialsMapping(factory);
   registerRigidDistanceMapping(factory);
   registerSphereSweptIntersectionMethod(factory);
+  registerContactFeeder(factory);
+  registerBeamContactMapping(factory);
 }
 
 const char *getModuleLicense() { return "LGPL"; }

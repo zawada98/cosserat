@@ -1,0 +1,26 @@
+\contentsline {section}{\numberline {1}Overview}{1}{section.1}%
+\contentsline {section}{\numberline {2}SSIM Output: What the Mapping Receives}{1}{section.2}%
+\contentsline {subsection}{\numberline {2.1}ALGO\_1 -- Segment-to-Segment}{1}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}ALGO\_2 -- Node-to-Segment}{1}{subsection.2.2}%
+\contentsline {section}{\numberline {3}Forward Map: Contact-Point Positions (\texttt {apply})}{2}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Centreline Interpolation}{2}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Contact Normal}{2}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Surface Contact Points}{2}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Radial Moment Arms}{2}{subsection.3.4}%
+\contentsline {section}{\numberline {4}Tangent Map: Velocity Jacobian (\texttt {applyJ})}{2}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Rigid-Frame Velocity Representation}{2}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Velocity of the Centreline Contact Point}{3}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Velocity of the Surface Contact Point}{3}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Compact Jacobian Notation}{3}{subsection.4.4}%
+\contentsline {section}{\numberline {5}Transpose Map: Force Back-Propagation (\texttt {applyJT})}{4}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Virtual Work Principle}{4}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Normal vs.\ Tangential Forces}{4}{subsection.5.2}%
+\contentsline {paragraph}{Normal contact force.}{4}{section*.2}%
+\contentsline {paragraph}{Tangential (friction) force.}{4}{section*.3}%
+\contentsline {section}{\numberline {6}Constraint Jacobian (\texttt {applyJT} MatrixDeriv)}{4}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Role in the Constraint Solver}{4}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Mapping to Input Space}{5}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}Normal Constraint Row (Explicit Form)}{5}{subsection.6.3}%
+\contentsline {subsection}{\numberline {6.4}Tangential Constraint Row (Explicit Form)}{5}{subsection.6.4}%
+\contentsline {section}{\numberline {7}ALGO\_1 vs.\ ALGO\_2: Summary of Differences}{5}{section.7}%
+\contentsline {section}{\numberline {8}Symbol Glossary}{6}{section.8}%

@@ -5,6 +5,7 @@ set(HEADER_FILES
 
     mapping/BaseCosserat.h
     mapping/BaseCosserat.inl
+    mapping/BeamContactMapping.h
     mapping/DiscreteCosseratMapping.h
     mapping/DiscreteCosseratMapping.inl
     mapping/DiscretDynamicCosseratMapping.h
@@ -38,12 +39,14 @@ set(HEADER_FILES
     constraint/CosseratNeedleSlidingConstraint.inl
 
     intersection/SphereSweptIntersectionMethod.h
+    intersection/ContactFeeder.h
     )
 
 set(SOURCE_FILES
     initCosserat.cpp
 
     mapping/BaseCosserat.cpp
+    mapping/BeamContactMapping.cpp
     mapping/DiscreteCosseratMapping.cpp
     mapping/DiscreteDynamicCosseratMapping.cpp
     mapping/DifferenceMultiMapping.cpp
@@ -60,8 +63,8 @@ set(SOURCE_FILES
     constraint/CosseratSlidingConstraint.cpp
     constraint/QPSlidingConstraint.cpp
     constraint/CosseratNeedleSlidingConstraint.cpp
-
     intersection/SphereSweptIntersectionMethod.cpp
+    intersection/ContactFeeder.cpp
     )
 
 # add_subdirectory(Binding)
