@@ -2,7 +2,7 @@
 // Created by younes on 07/06/2021.
 //
 
-#include <Cosserat/config.h>
+//#include <Cosserat/config.h>
 
 #include <gtest/gtest.h>
 #include <sofa/testing/BaseTest.h>

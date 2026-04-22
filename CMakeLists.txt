@@ -26,6 +26,7 @@ set(HEADER_FILES
     ${SRC_ROOT_DIR}/types.h
     ${SRC_ROOT_DIR}/mapping/BaseCosseratMapping.h
     ${SRC_ROOT_DIR}/mapping/BaseCosseratMapping.inl
+    ${SRC_ROOT_DIR}/mapping/BeamContactMapping.h
     ${SRC_ROOT_DIR}/mapping/DiscreteCosseratMapping.h
     ${SRC_ROOT_DIR}/mapping/DiscreteCosseratMapping.inl
     ${SRC_ROOT_DIR}/mapping/DiscreteDynamicCosseratMapping.h
@@ -51,10 +52,12 @@ set(HEADER_FILES
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.h
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.inl
     ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.h
+    ${SRC_ROOT_DIR}/intersection/ContactFeeder.h
     )
 set(SOURCE_FILES
     ${SRC_ROOT_DIR}/initCosserat.cpp
     ${SRC_ROOT_DIR}/mapping/BaseCosseratMapping.cpp
+    ${SRC_ROOT_DIR}/mapping/BeamContactMapping.cpp
     ${SRC_ROOT_DIR}/mapping/DiscreteCosseratMapping.cpp
     ${SRC_ROOT_DIR}/mapping/DiscreteDynamicCosseratMapping.cpp
     ${SRC_ROOT_DIR}/engine/ProjectionEngine.cpp
@@ -68,6 +71,7 @@ set(SOURCE_FILES
     ${SRC_ROOT_DIR}/mapping/LegendrePolynomialsMapping.cpp
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.cpp
     ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.cpp
+    ${SRC_ROOT_DIR}/intersection/ContactFeeder.cpp
     )
 
 

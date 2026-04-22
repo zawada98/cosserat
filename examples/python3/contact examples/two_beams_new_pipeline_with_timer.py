@@ -171,7 +171,6 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
                           rayleighStiffness=0.2, rayleighMass=0.1)
     solver_node.addObject('SparseLDLSolver', name='solver',
                           template='CompressedRowSparseMatrixd')
-    #solver_node.addObject('BlockGaussSeidelConstraintSolver', tolerance=1e-5, maxIterations=5e2)
     solver_node.addObject('GenericConstraintCorrection', linearSolver = solver_node.solver.getLinkPath())
 
     rigid_base_node = solver_node.addChild('rigidBase')
@@ -182,12 +181,10 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
         showObject=True, showObjectScale=3.0)
 
     if fully_fixed:
-        # ── Fix the rigid base completely ──────────────────────────────────
         rigid_base_node.addObject(
             'FixedProjectiveConstraint', name='fixBase',
             indices=[0])
     else:
-        # ── Clamp the base with a stiff spring (allows small elastic reaction) ─
         rigid_base_node.addObject(
             'RestShapeSpringsForceField', name='clamp',
             stiffness=stiffness, angularStiffness=stiffness,
@@ -205,7 +202,6 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
         poissonRatio=poisson_ratio)
 
     if fully_fixed:
-        # ── Fix all cosserat strains (zero = straight reference config) ────
         all_section_ids = list(range(nb_sections))
         coord_node.addObject(
             'FixedProjectiveConstraint', name='fixStrains',
@@ -218,7 +214,6 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
         position=frames, showObject=True, showObjectScale=2.0)
 
     if not fully_fixed:
-        # Only the free beam needs mass; the fixed beam has none.
         frame_node.addObject('UniformMass', totalMass=0.1)
 
     frame_node.addObject(
@@ -260,7 +255,6 @@ def add_visual_model(framesNode, frames, rex):
     quads = _tube_quads(N, n_sides)
     safe_name = "Tube"
 
-
     for r, color_list, suffix in [
         (rex, [0.85, 0.15, 0.15, 1.0], 'outer')
     ]:
@@ -269,7 +263,6 @@ def add_visual_model(framesNode, frames, rex):
 
         vis = framesNode.addChild(f'visual_{suffix}_{safe_name}')
 
-        # Topology (rest positions, connectivity)
         vis.addObject('MeshTopology', name='topo',
                       position=ring_pos, quads=quads)
 
@@ -281,7 +274,6 @@ def add_visual_model(framesNode, frames, rex):
                       rigidIndexPerPoint=rigid_idx,
                       globalToLocalCoords=False)
 
-        # OglModel in child node, driven by IdentityMapping from visMO
         ogl = vis.addChild('ogl')
         ogl.addObject('OglModel', name='oglModel',
                       src='@../topo',
@@ -293,6 +285,163 @@ def add_visual_model(framesNode, frames, rex):
 
 # ── Output directory (same folder as the scene file) ─────────────────────────
 SCENE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Timing infrastructure  (mirrors classic pipeline's TimingLogger exactly)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TimingLogger(Sofa.Core.Controller):
+    """
+    Per-step contact-detection timer with real-time file flushing.
+
+    Every recorded step is written and flushed to disk immediately inside
+    _record(), so no data is lost if the scene freezes or crashes.
+
+    Files produced:
+        <SCENE_DIR>/<label>_detection_times.txt   (real-time, always)
+        <SCENE_DIR>/<label>_detection_times.xlsx  (at exit, if openpyxl available)
+    """
+
+    def __init__(self, *args, label="timer", log_interval=50, **kwargs):
+        Sofa.Core.Controller.__init__(self, *args, **kwargs)
+        self.label           = label
+        self.log_interval    = log_interval
+        self.detection_times = []
+        self._step           = 0
+
+        self._txt_path = os.path.join(SCENE_DIR,
+                                      f"{self.label}_detection_times.txt")
+        self._file = open(self._txt_path, "w", buffering=1)
+        self._file.write("# Contact-detection timing log\n")
+        self._file.write(f"# label : {self.label}\n")
+        self._file.write("#\n")
+        self._file.write("step,detection_time_ms\n")
+        self._file.flush()
+
+        atexit.register(self._on_exit)
+
+    def _record(self, elapsed: float):
+        """
+        Record one step. Writes and flushes the txt file immediately.
+        """
+        self._step += 1
+        elapsed_ms  = elapsed * 1e3
+        self.detection_times.append(elapsed_ms)
+
+        self._file.write(f"{self._step},{elapsed_ms:.6f}\n")
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+        if self._step % self.log_interval == 0:
+            mean_ms = sum(self.detection_times) / len(self.detection_times)
+            print(f"[{self.label}] step {self._step:5d} | "
+                  f"mean: {mean_ms:.4f} ms | "
+                  f"last: {elapsed_ms:.4f} ms")
+
+    def _on_exit(self):
+        if not self.detection_times:
+            self._file.close()
+            return
+
+        n       = len(self.detection_times)
+        mean_ms = sum(self.detection_times) / n
+        min_ms  = min(self.detection_times)
+        max_ms  = max(self.detection_times)
+
+        self._file.write("#\n")
+        self._file.write(f"# --- SUMMARY ---\n")
+        self._file.write(f"# steps    : {n}\n")
+        self._file.write(f"# mean(ms) : {mean_ms:.6f}\n")
+        self._file.write(f"# min(ms)  : {min_ms:.6f}\n")
+        self._file.write(f"# max(ms)  : {max_ms:.6f}\n")
+        self._file.flush()
+        self._file.close()
+        print(f"[{self.label}] TXT saved → {self._txt_path}")
+
+        if _HAS_OPENPYXL:
+            self._write_xlsx(n, mean_ms, min_ms, max_ms)
+
+    def _write_xlsx(self, n, mean_ms, min_ms, max_ms):
+        path = os.path.join(SCENE_DIR, f"{self.label}_detection_times.xlsx")
+        wb   = openpyxl.Workbook()
+
+        ws_data = wb.active
+        ws_data.title = "Detection Times"
+
+        header_fill = PatternFill("solid", fgColor="1F4E79")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col, h in enumerate(["Step", "Detection Time (ms)"], start=1):
+            cell           = ws_data.cell(row=1, column=col, value=h)
+            cell.font      = header_font
+            cell.fill      = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for i, t in enumerate(self.detection_times, start=1):
+            ws_data.cell(row=i + 1, column=1, value=i)
+            ws_data.cell(row=i + 1, column=2, value=round(t, 6))
+
+        ws_data.column_dimensions["A"].width = 10
+        ws_data.column_dimensions["B"].width = 24
+
+        ws_sum = wb.create_sheet("Summary")
+        key_font = Font(bold=True)
+        key_fill = PatternFill("solid", fgColor="D6E4F0")
+        for row_idx, (key, val) in enumerate([
+            ("Label",      self.label),
+            ("Steps",      n),
+            ("Mean (ms)",  round(mean_ms, 6)),
+            ("Min (ms)",   round(min_ms,  6)),
+            ("Max (ms)",   round(max_ms,  6)),
+            ("Total (ms)", round(sum(self.detection_times), 6)),
+        ], start=1):
+            kc      = ws_sum.cell(row=row_idx, column=1, value=key)
+            kc.font = key_font
+            kc.fill = key_fill
+            ws_sum.cell(row=row_idx, column=2, value=val)
+
+        ws_sum.column_dimensions["A"].width = 16
+        ws_sum.column_dimensions["B"].width = 24
+
+        wb.save(path)
+        print(f"[{self.label}] XLSX saved → {path}")
+
+
+# ── Contact-detection timer (SSIM pipeline) ───────────────────────────────────
+class SSIMDetectionTimer(TimingLogger):
+    """
+    Times the SphereSweptIntersectionMethod detection phase by forcing a
+    fresh SSIM update at the start of each animate step and measuring how
+    long it takes to read back the distances output.
+
+    Timing scope
+    ------------
+    The SSIM is a DataEngine — it runs lazily when its outputs are first
+    accessed.  This controller calls ssim.update() explicitly at
+    onAnimateBeginEvent and measures only that call, giving a direct
+    measure of the SSIM detection cost isolated from the rest of the step.
+
+    This is the exact equivalent of CollisionBeginEvent→CollisionEndEvent
+    in the classic pipeline (BruteForceBroadPhase + BVHNarrowPhase +
+    LocalMinDistance).
+
+    Output files (same format as classic pipeline):
+        ssim_pipeline_detection_times.txt
+        ssim_pipeline_detection_times.xlsx
+    """
+
+    def __init__(self, ssim_component, *args, **kwargs):
+        kwargs.setdefault("label", "ssim_pipeline")
+        TimingLogger.__init__(self, *args, **kwargs)
+        self._ssim = ssim_component
+
+    def onAnimateBeginEvent(self, event):
+        t0 = time.perf_counter()
+        # Reading an output Data field forces the DataEngine to recompute.
+        # This is equivalent to calling update() — SofaPython3 does not
+        # expose update() directly on DataEngine subclasses.
+        _ = self._ssim.distances.value
+        self._record(time.perf_counter() - t0)
 
 
 def createScene(root_node: Sofa.Core.Node):
@@ -352,7 +501,6 @@ def createScene(root_node: Sofa.Core.Node):
     root_node.addObject('FreeMotionAnimationLoop')
     root_node.addObject('BackgroundSetting', color=[0.05, 0.05, 0.12, 1.0])
 
-    # Camera positioned to see both beams from a 3/4-angle view
     root_node.addObject('Camera',
                         position=[-40, -80, 120],
                         lookAt=[50, 0, 0])
@@ -369,10 +517,6 @@ def createScene(root_node: Sofa.Core.Node):
     root_node.addObject('BlockGaussSeidelConstraintSolver',tolerance=1e-5, maxIterations=500)
 
     # ── Beam 1 – horizontal along +X, COMPLETELY FIXED ───────────────────────
-    #
-    #   Axis:  X ∈ [0, L]   Y = 0   Z = 0
-    #   This beam never deforms or translates; it is a rigid obstacle.
-    #
     beam1_framesNode, beam1_frames = add_cosserat_beam(
         root_node, 'Beam1_Fixed',
         base_pos   = [0., 0., 0.],
@@ -388,18 +532,9 @@ def createScene(root_node: Sofa.Core.Node):
         fully_fixed    = True,
     )
 
-
     add_visual_model(beam1_framesNode, beam1_frames, RADIUS)
 
     # ── Beam 2 – along +X (parallel to Beam 1), CLAMPED at base, free end falls ─
-    #
-    #   Same orientation as Beam 1 (quaternion [0,0,0,1]).
-    #   Base at [0, 0, GAP_Z] so both beams share the same X axis range and
-    #   Beam 2 starts GAP_Z mm directly above Beam 1.
-    #
-    #   Gravity acts in -Z: the free end bends downward until it contacts Beam 1.
-    #   The base end (X = 0) is held by the RestShapeSpringsForceField clamp.
-    #
     beam2_framesNode, beam2_frames = add_cosserat_beam(
         root_node, 'Beam2_Cantilever',
         base_pos   = [0., 0., GAP_Z],
@@ -414,14 +549,14 @@ def createScene(root_node: Sofa.Core.Node):
         beam_number    = 2,
         fully_fixed    = False,
     )
-    add_visual_model(beam2_framesNode,beam2_frames, RADIUS)
+    add_visual_model(beam2_framesNode, beam2_frames, RADIUS)
 
     intersection_node = root_node.addChild('IntersectionNode')
 
     beam1_MO = beam1_framesNode.FramesMO
     beam2_MO = beam2_framesNode.FramesMO
 
-    ssim=intersection_node.addObject(
+    ssim = intersection_node.addObject(
         'SphereSweptIntersectionMethod',
         name='ssim',
         beam1Frames=beam1_MO.getLinkPath() + '.position',
@@ -430,6 +565,17 @@ def createScene(root_node: Sofa.Core.Node):
         radius2=RADIUS,
         algorithmType=ALGORITHM,
     )
+
+    # ── SSIM detection timer (mirrors CollisionDetectionTimer in classic pipeline) ──
+    # SSIMDetectionTimer.onAnimateBeginEvent calls ssim.update() and times it.
+    # This isolates the SSIM detection cost from constraint solving and mechanics,
+    # making it directly comparable to CollisionBeginEvent→CollisionEndEvent timing
+    # in the classic pipeline.
+    root_node.addObject(SSIMDetectionTimer(
+        ssim_component=ssim,
+        name='ssimTimer',
+        log_interval=50,
+    ))
 
     contact_output = beam1_framesNode.addChild('contactOutput')
     beam2_framesNode.addChild(contact_output)
