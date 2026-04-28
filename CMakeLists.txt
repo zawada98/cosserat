@@ -33,6 +33,7 @@ set(HEADER_FILES
     ${SRC_ROOT_DIR}/mapping/DiscreteDynamicCosseratMapping.inl
     ${SRC_ROOT_DIR}/engine/ProjectionEngine.h
     ${SRC_ROOT_DIR}/engine/ProjectionEngine.inl
+    ${SRC_ROOT_DIR}/engine/ContactTriad.h
     ${SRC_ROOT_DIR}/mapping/DifferenceMultiMapping.h
     ${SRC_ROOT_DIR}/mapping/DifferenceMultiMapping.inl
     ${SRC_ROOT_DIR}/mapping/RigidDistanceMapping.h
@@ -51,7 +52,8 @@ set(HEADER_FILES
     ${SRC_ROOT_DIR}/mapping/LegendrePolynomialsMapping.inl
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.h
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.inl
-    ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.h
+    ${SRC_ROOT_DIR}/constraint/ContactPointsUnilateralConstraint.h
+    ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.h 
     ${SRC_ROOT_DIR}/intersection/ContactFeeder.h
     )
 set(SOURCE_FILES
@@ -70,7 +72,8 @@ set(SOURCE_FILES
     ${SRC_ROOT_DIR}/constraint/CosseratSlidingConstraint.cpp
     ${SRC_ROOT_DIR}/mapping/LegendrePolynomialsMapping.cpp
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.cpp
-    ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.cpp
+    ${SRC_ROOT_DIR}/constraint/ContactPointsUnilateralConstraint.cpp
+    ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.cpp 
     ${SRC_ROOT_DIR}/intersection/ContactFeeder.cpp
     )
 

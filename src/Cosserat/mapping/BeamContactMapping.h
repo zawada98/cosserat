@@ -21,9 +21,9 @@
  ******************************************************************************/
 #pragma once
 #include <Cosserat/config.h>
-
 #include <sofa/core/Multi2Mapping.h>
 #include <sofa/core/objectmodel/Data.h>
+#include <sofa/core/objectmodel/Link.h>        
 #include <sofa/core/ConstraintParams.h>
 #include <sofa/core/MultiVecId.h>
 #include <sofa/defaulttype/RigidTypes.h>
@@ -33,17 +33,19 @@
 #include <sofa/type/fixed_array.h>
 #include <array>
 #include <string>
+#include <Cosserat/engine/ContactTriad.h>  
+
+// Forward declaration – full definition included only in the .cpp.
+namespace Cosserat { class SphereSweptIntersectionMethod; }
 
 namespace sofa { namespace core { class ObjectFactory; } }
 
 namespace Cosserat
 {
-    namespace
-    {
-        using sofa::type::Vec3d;
-        using sofa::type::Vec2d;
-        using sofa::type::Vec;
-    } // anonymous namespace
+    using sofa::type::Vec3d;
+    using sofa::type::Vec2d;
+    using sofa::type::Vec;
+    using VecVec3 = sofa::type::vector<sofa::type::Vec3d>; 
 
     /*!
      * \class BeamContactMapping
@@ -66,12 +68,25 @@ namespace Cosserat
      *       out[0][2k]   = Pc_A[k] = P_A(α) + r₁·n̂
      *     Odd  indices  → Beam-2 surface points (Pc_B):
      *       out[0][2k+1] = Pc_B[k] = P_B(β) − r₂·n̂
-     *     n̂ = (P_B − P_A) / ‖P_B − P_A‖
+     *     n̂ = (P_B − P_A) / ‖P_B − P_A‖  (fetched from SSIM, never recomputed here)
      *
-     *   mode = "gap":
+     *   mode = "gap":                                                           
      *     ONE output MechanicalObject of size K.
-     *     out[0][k] = δ[k] = Pc_B[k] − Pc_A[k] = (d − r₁ − r₂)·n̂
-     *     δ > 0 : separation;  δ < 0 : penetration.
+     *     out[0][k] = Vec3(δ_n[k], δ_t1[k], δ_t2[k])  — full 3D gap in contact-local frame.
+     *       δ_n  = (Pc_B − Pc_A) · n̂        (signed normal gap; < 0 = penetration)
+     *       δ_t1 = (Pc_B − Pc_A) · t̂₁       (axial tangential gap)
+     *       δ_t2 = (Pc_B − Pc_A) · t̂₂       (circumferential tangential gap)
+     *       (to be fair, in δ_n the formula might be = (Pc_A − Pc_B) · n̂ 
+     *       basically, it is the case when the two beams are nested and beam 2
+     *       inner one, i.e. Pc_B is on inner tube).
+     *     Contact-local frame basis (identical to SSIM d_distances convention):  
+     *       n̂   – unit contact normal from SSIM (Beam-1 → Beam-2 for external;
+     *              outer → inner for nested CTR)
+     *       t̂₁  – normalize(τ₁ − (τ₁·n̂)·n̂), τ₁ = Beam-1 segment axial chord
+     *       t̂₂  – n̂ × t̂₁  (circumferential direction)
+     *
+     *     applyJ  gives δ̇ = Vec3(s.Ṗ_rel·n̂, Ṗ_rel·t̂₁, Ṗ_rel·t̂₂).
+     *     applyJT back-projects: d = n̂·d[0] + t̂₁·d[1] + t̂₂·d[2] before J^T.
      *
      * ALGO_1 (segment-to-segment, isAlgo2 = false):
      *   sectionIds[k] = {i,j}  →  segment i on Beam-1, segment j on Beam-2
@@ -79,9 +94,18 @@ namespace Cosserat
      *   Beam-2 interpolation: frames[j]*(1−β) + frames[j+1]*β
      *
      * ALGO_2 (node-to-segment, isAlgo2 = true):
-     *   sectionIds[k] = {i,j}  →  node i on Beam-1, segment j on Beam-2
-     *   Beam-1: frame[i] alone, weight = 1  (α = 0 always)
-     *   Beam-2: frames[j]*(1−β) + frames[j+1]*β
+     *   SSIM guarantees that across all K contact pairs, either s1[k]≡0 for all k
+     *   (Beam-1 is the node side) or s2[k]≡0 for all k (Beam-2 is the node side).
+     *   BCM detects this once per apply() by scanning curvilinearParams:
+     *     if ∃ k : s1[k] > 0  →  Beam-2 is node, Beam-1 is segment
+     *     if ∃ k : s2[k] > 0  →  Beam-1 is node, Beam-2 is segment
+     *     else (all zero)     →  degenerate; default to Beam-1 is node
+     *   We scan (rather than check a single pair) because a contact landing
+     *   exactly on a segment endpoint gives s=0 on the SEGMENT side too, which
+     *   is not a global swap signal.
+     *
+     *   Node-side k:     frame[i] alone, weight = 1
+     *   Segment-side k:  frames[j]*(1−γ) + frames[j+1]*γ, γ ∈ [0,1] from SSIM
      */
     class SOFA_COSSERAT_API BeamContactMapping
         : public sofa::core::Multi2Mapping<
@@ -125,33 +149,61 @@ namespace Cosserat
         using Vec3 = sofa::type::Vec3d;
         using Vec2d = sofa::type::Vec2d;
         using Vec2i = sofa::type::Vec<2, int>;
-
-        // ── Data fields (SSIM inputs) ─────────────────────────────────────────
-        /// Per-contact {i,j} index pair: Beam-1 segment (ALGO_1) or node (ALGO_2) index i,
-        /// Beam-2 segment index j.  Produced by SphereSweptIntersectionMethod.
-        sofa::core::objectmodel::Data<sofa::type::vector<Vec2i>>  d_contactSectionIds;
-
-        /// Per-contact {α,β} curvilinear parameters on [0,1].
-        /// ALGO_2: α = 0 always (contact at Beam-1 node i).
-        sofa::core::objectmodel::Data<sofa::type::vector<Vec2d>>  d_curvilinearParams;
-
-        /// Cross-section radius of Beam-1 (same length unit as frame positions).
-        sofa::core::objectmodel::Data<Real>                       d_radius1;
-
-        /// Cross-section radius of Beam-2.
-        sofa::core::objectmodel::Data<Real>                       d_radius2;
-
-        /// True when SSIM runs ALGO_2 (node-to-segment); false for ALGO_1 (segment-to-segment).
-        sofa::core::objectmodel::Data<bool>                       d_isAlgo2;
-
+        
         /// Output mapping mode: "contactPoints" or "gap" (default).
         ///
         /// Both modes require exactly ONE connected output MechanicalObject.
         ///
         /// "contactPoints": output size = 2K. Even indices [2k] = Pc_A (Beam-1),
         ///                  odd indices [2k+1] = Pc_B (Beam-2).
-        /// "gap"          : output size = K.  Index [k] = Pc_B[k] - Pc_A[k].
+        ///                  applyJT(MatrixDeriv): passes d written by
+        ///                  UnilateralLagrangianConstraint directly through J^T.
+        ///
+        /// "gap": output size = K.                                                
+        ///   out[0][k] = Vec3(δ_n, δ_t1, δ_t2) in contact-local frame {n̂, t̂₁, t̂₂}.
+        ///   δ_n  = (Pc_B − Pc_A)·n̂  (normal gap, < 0 = penetration).
+        ///   δ_t1 = (Pc_B − Pc_A)·t̂₁ (axial tangential gap).
+        ///   δ_t2 = (Pc_B − Pc_A)·t̂₂ (circumferential tangential gap).
+        ///   (to be fair, in δ_n the formula might be = (Pc_A − Pc_B) · n̂ 
+        ///   basically, it is the case when the two beams are nested and beam 2 
+        ///   inner one, i.e. Pc_B is on inner tube).
+        ///   Contact frame matches SSIM d_distances convention (see class doc).
+        ///   applyJT(MatrixDeriv): converts Vec3(d_n, d_t1, d_t2) → d_phys = n̂·d_n + t̂₁·d_t1 + t̂₂·d_t2.
+        ///   applyJT(VecDeriv):    converts Vec3(F_n, F_t1, F_t2) → F_phys = n̂·F_n + t̂₁·F_t1 + t̂₂·F_t2.
         sofa::core::objectmodel::Data<std::string>                d_mappingMode;
+        
+        
+        /// Per-pair contact triad (n̂, t̂₁, t̂₂) written by apply().  One
+        /// ContactTriad entry per contact pair k, holding the full
+        /// orthonormal basis of the contact-local frame.  Downstream
+        /// constraints (CPULC for unilateral + friction; any friction-aware
+        /// gap-mode constraint) link here:
+        ///     contactTriads = '@<bcm>.contactTriads'
+        sofa::core::objectmodel::Data<VecContactTriad> d_contactTriads;
+        
+        ///   (Pc_B − Pc_A)·n̂ = s · δn
+        /// Populated in init() from SSIM::gapSignForPublishedNormal().
+        /// Downstream constraints link here:  gapSign = '@<bcm>.gapSign'
+        sofa::core::objectmodel::Data<SReal>           d_gapSign;
+        
+        sofa::core::objectmodel::Data<VecVec3>  d_distances;       
+        
+        /// Mandatory link to the SphereSweptIntersectionMethod that owns contact
+        /// normals. Normals are fetched via l_ssim->getContactNormal(k) and are
+        /// NEVER recomputed locally in BCM.
+        ///
+        /// In gap mode BCM also injects the normal into applyJT (both overloads)
+        /// because the new generic UnilateralLagrangianConstraint only writes
+        /// Vec3(1,0,0) — it carries no geometry knowledge.
+        ///
+        /// In contactPoints mode the existing UnilateralLagrangianConstraint writes
+        /// the physical direction; BCM passes it through J^T unchanged.
+        sofa::core::objectmodel::SingleLink<
+            BeamContactMapping,
+            SphereSweptIntersectionMethod,
+            sofa::core::objectmodel::BaseLink::FLAG_STRONGLINK |
+            sofa::core::objectmodel::BaseLink::FLAG_STOREPATH>    l_ssim;
+        // ──────────────────────────────────────────────────────────────────────
 
         // ── Constructor / SOFA lifecycle ──────────────────────────────────────
         BeamContactMapping();
@@ -232,6 +284,25 @@ namespace Cosserat
 
             sofa::type::fixed_array<JacBlock, 2> beam2Blocks;
             int nBeam2Blocks{ 0 };
+
+            // contact normal fetched from SSIM and frozen at apply() time.
+            // Used by applyJ and applyJT to project gap velocities / forces onto n.
+            // In contactPoints mode this field is unused (direction comes from ULC).
+            Vec3 normal{ Vec3(0,0,1) };
+            
+            /// Contact-plane axial tangent t̂₁ (projected Beam-1 segment chord ⊥ n̂). 
+            /// Identical to the t1_contact basis vector used by SSIM for d_distances[1].
+            /// Formula: normalize(τ₁ − (τ₁·n̂)·n̂),  τ₁ = unit chord of Beam-1 segment [i, i+1].
+            /// For ALGO_2: τ₁ from adjacent segment or frame local-X fallback.
+            Vec3 tangent1{ Vec3(Real(1), Real(0), Real(0)) };
+ 
+            /// Contact-plane circumferential tangent t̂₂ = n̂ × t̂₁.             
+            /// Identical to the t2_contact basis vector used by SSIM for d_distances[2].
+            Vec3 tangent2{ Vec3(Real(0), Real(1), Real(0)) };
+            
+            Real gapNormal   { Real(0) };   
+            Real gapTangent1 { Real(0) };   
+            Real gapTangent2 { Real(0) };  
         };
 
         /// Rebuilt every apply() call; consumed by applyJ / applyJT.

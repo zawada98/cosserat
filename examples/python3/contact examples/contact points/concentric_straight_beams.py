@@ -61,16 +61,19 @@ SCENE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ──────────────────────────────────────────────────────────────────────────────
 BEAM_LENGTH      = 120.0    # [mm]  total length of each beam
 NB_SECTIONS      = 6        # number of Cosserat sections per beam
-NB_FRAMES        = 20       # number of output Rigid3d frames per beam
-RADIUS           = 1.0      # [mm]  cross-section radius
+NB_FRAMES        = 100       # number of output Rigid3d frames per beam
+RADIUS1_EX       = 6.0      # [mm]  cross-section radius
+RADIUS1_IN       = 5.0      # [mm]  cross-section radius
+RADIUS2_EX       = 2.0      # [mm]  cross-section radius
+RADIUS2_IN       = 1.0      # [mm]  cross-section radius
 YOUNG_MODULUS    = 3.0e6    # [Pa]
 POISSON_RATIO    = 0.49
 STIFFNESS        = 1.0e8    # base-clamp stiffness  (Beam 2 clamped end)
 ALGORITHM        = "ALGO_1" # "ALGO_1" (segment-seg) or "ALGO_2" (node-seg NR)
-DT               = 0.0001     # [s]   time step
+DT               = 0.001     # [s]   time step
 MAX_STEPS        = 500      # stop automatically after this many steps
 MAX_K = NB_FRAMES
-ALARM_DISTANCE = 2.0 * RADIUS
+ALARM_DISTANCE = 3.0 * RADIUS2_EX
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Geometry
@@ -79,13 +82,18 @@ ALARM_DISTANCE = 2.0 * RADIUS
 #  Beam 1 – along global +X, centred at Y=0, Z=0  (fully fixed obstacle)
 #    base at [0, 0, 0], quaternion [0,0,0,1]
 #
-#  Beam 2 – along global +Y, base at [L/2, 0, GAP_Z]
-#    (so it crosses Beam 1 near the mid-span of both)
-#    quaternion for 90° rotation about Z:  [0, 0, sin45°, cos45°]
-#    With gravity in -Z the free end bends down and contacts Beam 1.
+#  Beam 2 – cantilever, clamped at base, free end falls under gravity (−Z).
+#    base at [0, GAP_Y, GAP_Z].
+#
+#    GAP_Z > 0  : Beam 2 starts above Beam 1.
+#    GAP_Y ≠ 0  : lateral eccentricity. Contact normal will lie in the (Y,Z)
+#                 plane, tilted by atan2(GAP_Y, effective vertical gap at
+#                 contact). GAP_Y = 0 reproduces the original axisymmetric
+#                 (purely vertical) configuration.
 #
 # Initial vertical gap between the two parallel beam axes
-GAP_Z = 20.0    # [mm]   must be > 2*RADIUS to start without interpenetration
+GAP_Z = 0.0    # [mm]   must be > 2*RADIUS to start without interpenetration
+GAP_Y = 0.0
 
 def extract_contact_points(parent_node, contactMO, MAX_K):
     even_indices = list(range(0, 2 * MAX_K, 2))
@@ -137,7 +145,7 @@ def _make_frame_params(nb_frames, length):
     return frames, curv_abs, edge_indices
 
 def add_cosserat_beam(parent_node, name, base_pos, base_quat,
-                      nb_sections, nb_frames, length, radius,
+                      nb_sections, nb_frames, length, radius, radius_in,
                       young_modulus, poisson_ratio, stiffness,
                       beam_number,fully_fixed=False):
     """
@@ -201,6 +209,7 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
         'BeamHookeLawForceField',
         crossSectionShape='circular',
         length=sec_len, radius=radius,
+        innerRadius = radius_in,
         youngModulus=young_modulus,
         poissonRatio=poisson_ratio)
 
@@ -232,9 +241,26 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
 
     return frame_node, frames
 
-def add_visual_model(framesNode, frames, rex):
+def add_visual_model(framesNode, frames, rex, color=(0.85, 0.15, 0.15, 1.0)):
+    """
+    Build a tube-shaped visual model around the mapped Rigid3d frames of a
+    Cosserat beam.
+
+    Parameters
+    ----------
+    framesNode : Sofa.Core.Node
+        The node holding the FramesMO (output Rigid3d frames of the beam).
+    frames : list
+        The list of frame positions+quaternions (used here only for its length).
+    rex : float
+        Outer radius of the cross-section [mm] – defines the tube radius.
+    color : sequence of 4 floats, optional
+        RGBA color of the tube surface, each component in [0, 1].
+        Default is red (0.85, 0.15, 0.15, 1.0).
+        Accepts any iterable of 4 floats (tuple, list, numpy array …).
+    """
     N = len(frames)
-    n_sides = 30
+    n_sides = 60
     TWO_PI = 2.0 * math.pi
 
     def _ring_positions(r):
@@ -262,7 +288,7 @@ def add_visual_model(framesNode, frames, rex):
 
 
     for r, color_list, suffix in [
-        (rex, [0.85, 0.15, 0.15, 1.0], 'outer')
+        (rex, list(color), 'outer')
     ]:
         ring_pos = _ring_positions(r) * N
         color_str = " ".join(str(v) for v in color_list)
@@ -380,7 +406,8 @@ def createScene(root_node: Sofa.Core.Node):
         nb_sections = NB_SECTIONS,
         nb_frames   = NB_FRAMES,
         length      = BEAM_LENGTH,
-        radius      = RADIUS,
+        radius      = RADIUS1_EX,
+        radius_in   = RADIUS1_IN,
         young_modulus  = YOUNG_MODULUS,
         poisson_ratio  = POISSON_RATIO,
         stiffness      = STIFFNESS,
@@ -389,7 +416,11 @@ def createScene(root_node: Sofa.Core.Node):
     )
 
 
-    add_visual_model(beam1_framesNode, beam1_frames, RADIUS)
+    add_visual_model(beam1_framesNode, beam1_frames,
+                     RADIUS1_IN, color=(0.55, 0.20, 0.75, 0.35))
+
+    add_visual_model(beam1_framesNode, beam1_frames,
+                     RADIUS1_EX, color=(0.55, 0.20, 0.75, 0.35))
 
     # ── Beam 2 – along +X (parallel to Beam 1), CLAMPED at base, free end falls ─
     #
@@ -402,19 +433,23 @@ def createScene(root_node: Sofa.Core.Node):
     #
     beam2_framesNode, beam2_frames = add_cosserat_beam(
         root_node, 'Beam2_Cantilever',
-        base_pos   = [0., 0., GAP_Z],
+        base_pos   = [0., GAP_Y, GAP_Z],
         base_quat  = [0., 0., 0., 1.],
         nb_sections = NB_SECTIONS,
         nb_frames   = NB_FRAMES,
         length      = BEAM_LENGTH,
-        radius      = RADIUS,
+        radius      = RADIUS2_EX,
+        radius_in   = RADIUS2_IN,
         young_modulus  = YOUNG_MODULUS,
         poisson_ratio  = POISSON_RATIO,
         stiffness      = STIFFNESS,
         beam_number    = 2,
         fully_fixed    = False,
     )
-    add_visual_model(beam2_framesNode,beam2_frames, RADIUS)
+    add_visual_model(beam2_framesNode,beam2_frames,
+                     RADIUS2_EX, color=(0.95, 0.85, 0.15, 1.0))
+    add_visual_model(beam2_framesNode, beam2_frames,
+                     RADIUS2_IN, color=(0.95, 0.85, 0.15, 1.0))
 
     intersection_node = root_node.addChild('IntersectionNode')
 
@@ -426,9 +461,15 @@ def createScene(root_node: Sofa.Core.Node):
         name='ssim',
         beam1Frames=beam1_MO.getLinkPath() + '.position',
         beam2Frames=beam2_MO.getLinkPath() + '.position',
-        radius1=RADIUS,
-        radius2=RADIUS,
+        beam1Velocities = beam1_MO.getLinkPath() + '.velocity',
+        beam2Velocities=beam2_MO.getLinkPath() + '.velocity',
+        radius1=RADIUS1_EX,
+        radius2=RADIUS2_EX,
+        innerRadius1 = RADIUS1_IN,
+        innerRadius2 = RADIUS2_IN,
         algorithmType=ALGORITHM,
+        contactConfiguration = "nested",
+        defaultNormal = "0 0 -1",
     )
 
     contact_output = beam1_framesNode.addChild('contactOutput')
@@ -439,27 +480,21 @@ def createScene(root_node: Sofa.Core.Node):
         name='contactMO_gap',
         position=[[0., 0., 0.]] * 2*MAX_K)
 
-    contact_output.addObject(
+    bcm = contact_output.addObject(
         'BeamContactMapping',
         name='bcm',
         input1=beam1_MO.getLinkPath(),
         input2=beam2_MO.getLinkPath(),
         output=contactMO.getLinkPath(),
-        ssim = ssim,
-        radius1=RADIUS,
-        radius2=RADIUS,
-        isAlgo2=ALGORITHM == 'ALGO_2',
-        mappingMode='contactPoints',
-        contactSectionIds=ssim.getLinkPath() + '.contactSectionIds',
-        curvilinearParams=ssim.getLinkPath() + '.curvilinearParams',
+        ssim = ssim.getLinkPath(),
+        mappingMode='contactPoints'
     )
 
     contact_output.addObject(
-        'ContactPointsUnilateralLagrangianConstraint',
-        template='Vec3d',
-        name='ulc',
-        object=contactMO.getLinkPath(),
+        'ContactPointsUnilateralConstraint',
+        name='cpuc',
         mu = 0.2,
-        distances='@bcm.distances'
+        contactTriads = bcm.getLinkPath() + '.contactTriads',
+        gapSign = bcm.getLinkPath() + '.gapSign',
         )
     return root_node

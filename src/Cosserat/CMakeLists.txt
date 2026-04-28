@@ -19,6 +19,7 @@ set(HEADER_FILES
     
     engine/ProjectionEngine.h
     engine/ProjectionEngine.inl
+    engine/ContactTriad.h
 
 
 
@@ -37,9 +38,11 @@ set(HEADER_FILES
     constraint/QPSlidingConstraint.inl
     constraint/CosseratNeedleSlidingConstraint.h
     constraint/CosseratNeedleSlidingConstraint.inl
+    constraint/ContactPointsUnilateralConstraint.h
 
     intersection/SphereSweptIntersectionMethod.h
     intersection/ContactFeeder.h
+
     )
 
 set(SOURCE_FILES
@@ -63,7 +66,8 @@ set(SOURCE_FILES
     constraint/CosseratSlidingConstraint.cpp
     constraint/QPSlidingConstraint.cpp
     constraint/CosseratNeedleSlidingConstraint.cpp
-    intersection/SphereSweptIntersectionMethod.cpp
+    constraint/ContactPointsUnilateralConstraint.cpp
+    intersection/SphereSweptIntersectionMethod.cpp 
     intersection/ContactFeeder.cpp
     )
 

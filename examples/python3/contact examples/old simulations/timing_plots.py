@@ -23,7 +23,7 @@ import matplotlib.ticker as ticker
 from matplotlib.lines import Line2D
 
 # ── File paths ────────────────────────────────────────────────────────────────
-DATA_DIR   = r"C:\Users\zawada\SOFA\plugins\Cosserat\examples\python3"
+DATA_DIR   = r"/"
 
 CLASSIC_FILE = os.path.join(DATA_DIR, "classic_pipeline_detection_times.txt")
 SSIM_FILE    = os.path.join(DATA_DIR, "ssim_pipeline_detection_times.txt")

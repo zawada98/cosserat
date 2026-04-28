@@ -6,6 +6,7 @@
  * See BeamContactMapping.h for full documentation.                          *
  ******************************************************************************/
 #include "BeamContactMapping.h"
+#include "Cosserat/intersection/SphereSweptIntersectionMethod.h"  
 
 #include <sofa/core/ObjectFactory.h>
 #include <sofa/core/MechanicalParams.h>
@@ -43,48 +44,51 @@ namespace Cosserat
 {
     BeamContactMapping::BeamContactMapping()
         : Inherit1()
-        , d_contactSectionIds(
-            initData(&d_contactSectionIds,
-                "contactSectionIds",
-                "Per-contact {i,j} index pair from SphereSweptIntersectionMethod.\n"
-                "ALGO_1: i = Beam-1 segment index, j = Beam-2 segment index.\n"
-                "ALGO_2: i = Beam-1 node index,    j = Beam-2 segment index."))
-        , d_curvilinearParams(
-            initData(&d_curvilinearParams,
-                "curvilinearParams",
-                "Per-contact {alpha,beta} curvilinear parameters in [0,1] from SSIM.\n"
-                "ALGO_2: alpha = 0 always (contact point coincides with Beam-1 node i)."))
-        , d_radius1(
-            initData(&d_radius1, Real(0.1),
-                "radius1",
-                "Cross-section radius of Beam-1 (same length unit as frame positions)."))
-        , d_radius2(
-            initData(&d_radius2, Real(0.1),
-                "radius2",
-                "Cross-section radius of Beam-2."))
-        , d_isAlgo2(
-            initData(&d_isAlgo2, false,
-                "isAlgo2",
-                "Set true when SSIM runs ALGO_2 (node-to-segment).\n"
-                "Changes the role of sectionIds[k].x() from segment index to node index\n"
-                "and forces nBeam1Blocks = 1 with weight = 1.")) //TODO: maybe change name
+        , l_ssim(initLink("ssim",
+                "Mandatory link to the SphereSweptIntersectionMethod that provides "
+                "contact normals via getContactNormal(k). "
+                "Set via the 'ssim' attribute in the SOFA scene, e.g.: "
+                "ssim='@contact_node/ssim'."))
         , d_mappingMode(
             initData(&d_mappingMode, std::string("gap"),
                 "mappingMode",
-                // MODIFIED: both modes now require exactly ONE connected output MO.
                 "Output mapping mode.  Both modes use exactly ONE connected output MO.\n"
-                "  'contactPoints': output size = 2K (K = number of contact pairs).\n"
-                "    Even indices : out[0][2k]   = Pc_A[k] = P_A + r1*n  (Beam-1 surface).\n"
-                "    Odd  indices : out[0][2k+1] = Pc_B[k] = P_B - r2*n  (Beam-2 surface).\n"
-                "    n = (P_B - P_A) / ||P_B - P_A||.\n"
-                "    applyJ  gives interleaved velocities [Vc_A[0], Vc_B[0], Vc_A[1], ...].\n"
-                "    applyJT back-projects: even inForce rows -> Beam-1, odd -> Beam-2.\n"
-                "    applyJT(MatrixDeriv): even cols -> Beam-1, odd cols -> Beam-2.\n"
                 "  'gap': output size = K.\n"
-                "    out[0][k] = Pc_B[k] - Pc_A[k] = (d - r1 - r2)*n  (gap vector).\n"
-                "    delta > 0: separation;  delta < 0: penetration.\n"
-                "    applyJ  gives gap velocity: delta_dot = Pc_B_dot - Pc_A_dot.\n"
-                "    applyJT back-projects: Beam-1 gets -w*F, Beam-2 gets +w*F."))
+               "    out[0][k] = Vec3(delta_n, delta_t1, delta_t2) in contact-local frame.\n"
+               "      delta_n  = (Pc_B - Pc_A).n  (signed normal gap, <0 = penetration).\n"
+               "      delta_t1 = (Pc_B - Pc_A).t1 (axial tangential gap).\n"
+               "      delta_t2 = (Pc_B - Pc_A).t2 (circumferential tangential gap).\n"
+               "    Contact frame {n, t1, t2} matches SSIM d_distances convention:\n"
+               "      t1 = normalize(tau1 - (tau1.n)*n), tau1 = Beam-1 segment chord.\n"
+               "      t2 = n x t1.\n"
+               "    applyJ  gives gap velocity Vec3(dPrel.n, dPrel.t1, dPrel.t2).\n"
+               "    applyJT converts Vec3(F_n,F_t1,F_t2) -> F_phys = n*F_n + t1*F_t1 + t2*F_t2.\n"
+               "  'contactPoints': output size = 2K (K = number of contact pairs).\n"
+               "    Even indices : out[0][2k]   = Pc_A[k] = Pa + r1*n  (Beam-1 surface).\n"
+               "    Odd  indices : out[0][2k+1] = Pc_B[k] = Pb - r2*n  (Beam-2 surface).\n"
+               "    n = (Pb - Pa) / ||Pb - Pa||, fetched from SSIM.\n"
+               "    applyJ  gives interleaved velocities [Vc_A[0], Vc_B[0], Vc_A[1], ...].\n"
+               "    applyJT back-projects: even inForce rows -> Beam-1, odd -> Beam-2.\n"
+               "    applyJT(MatrixDeriv): even cols -> Beam-1, odd cols -> Beam-2."))
+        , d_contactTriads(
+            initData(&d_contactTriads,        
+                "contactTriads",
+                "Per-pair contact triad (n̂, t̂₁, t̂₂) written by apply().\n"
+                "  n   — unit contact normal, external → internal.\n"
+                "  t1  — Beam-1 tangent projected onto the contact plane.\n"
+                "  t2  — circumferential,  t2 = n × t1 (right-handed).\n"
+                "Downstream constraints (CPULC) link to this field for both the\n"
+                "normal row and, when μ > 0, the two friction rows."))
+        , d_gapSign(initData(&d_gapSign, SReal(1),          
+                "gapSign",
+                "Global gap sign s ∈ {+1, −1} such that (Pc_B − Pc_A)·n̂ = s·δn.\n"
+                "Fetched from SSIM::gapSignForPublishedNormal() in init().\n"
+                "Downstream constraints link here to compute dfree consistently."))
+        , d_distances(initData(&d_distances,
+            "distances",
+            "Consolidated gap Vec3(δn, δt1, δt2)[k] written by apply().\n"
+            "δt1/δt2 come from SSIM::d_distances[k][1,2] (velocity-integrated).\n"
+            "Link DUCL/CPULC to this field instead of to SSIM."))
     {
     }
 
@@ -93,9 +97,16 @@ namespace Cosserat
     // ─────────────────────────────────────────────────────────────────────────────
     void BeamContactMapping::init()
     {
-        // Validate the mode string at init time so the user gets a clear error
-        // rather than silent misbehaviour at simulation start.
-        std::cerr << ">>> [BCM] ctor done, nFields=" << this->getDataFields().size() << std::endl;
+        // Modified – validate SSIM link before anything else.
+        if (!l_ssim.get())
+        {
+            msg_error() << "The 'ssim' link is not set. "
+                           "BeamContactMapping requires a valid link to a "
+                           "SphereSweptIntersectionMethod object to fetch contact normals. "
+                           "Add ssim='@<path>/<ssimName>' to the addObject() call.";
+            // Do not return: let the rest of init() run so SOFA reports all errors
+            // at once rather than stopping at the first one.
+        }
 
         const std::string& mode = d_mappingMode.getValue();
         if (mode != "contactPoints" && mode != "gap")
@@ -106,7 +117,10 @@ namespace Cosserat
             d_mappingMode.setValue("gap");
 
         }
-
+        
+        if (l_ssim.get())
+            d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
+        
         Inherit1::init();
     }
 
@@ -115,45 +129,51 @@ namespace Cosserat
         Inherit1::reinit();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     //  apply
     //
     //  Computes output positions and rebuilds the Jacobian cache.
     //
-    //  ── Geometry (shared by both modes) ────────────────────────────────────────
+    //  ── Geometry ─────────────────────────────────────────────────────────────
     //
-    //  ALGO_1 (isAlgo2 = false):
-    //    P_A  = (1−α)·p[i]  + α·p[i+1]           (Beam-1 centreline)
-    //    P_B  = (1−β)·p[j]  + β·p[j+1]           (Beam-2 centreline)
+    //  Surface contact points Pc_A and Pc_B are read from SSIM:       
+    //    Pc_A = l_ssim->d_surfacePoints1[k]
+    //    Pc_B = l_ssim->d_surfacePoints2[k]
+    //  SSIM already accounts for all modes (external / nested CTR, solid / hollow)
+    //  and applies the correct contact-relevant radii.  BCM never recomputes them.
     //
-    //  ALGO_2 (isAlgo2 = true), α = 0 always:
-    //    P_A  = p[i]                               (Beam-1 node, no interpolation)
-    //    P_B  = (1−β)·p[j]  + β·p[j+1]           (same as ALGO_1)
+    //  Moment arms still use input-MO frame centres (Pc − p_frame), since
+    //  those are not exported by SSIM.
     //
-    //  Common:
-    //    n̂   = (P_B − P_A) / ‖P_B − P_A‖
-    //    Pc_A = P_A + r₁·n̂
-    //    Pc_B = P_B - r₂·n̂
+    //  ── Contact-local frame (gap mode) ───────────────────────────────────────  
     //
-    //  ── output layout ──────────────────────────────────────────────────────────
+    //  Identical to SSIM d_distances convention:
+    //    τ₁  = unit chord of Beam-1 segment [i, i+1]  (ALGO_1)
+    //           or local-X of frame[i]               (ALGO_2, node has no segment)
+    //    t̂₁ = normalize(τ₁ − (τ₁·n̂)·n̂)             (projected onto contact plane)
+    //    t̂₂ = n̂ × t̂₁                                (circumferential)
+    //
+    //  Stored in m_jacCache[k].tangent1 / .tangent2 so applyJ / applyJT can
+    //  use them without re-fetching from SSIM.
+    //
+    //  ── Output layout ────────────────────────────────────────────────────────
     //
     //  mode = "contactPoints":
     //    Single output MO, size 2K (interleaved):
     //    out[0][2k]   = Pc_A[k]   (Beam-1 surface point)
     //    out[0][2k+1] = Pc_B[k]   (Beam-2 surface point)
     //
-    //  mode = "gap":
-    //    out[0][k] = Pc_B[k] − Pc_A[k]  =  (d − r₁ − r₂)·n̂
+    //  mode = "gap":                                                     
+    //    out[0][k] = Vec3(δ_n, δ_t1, δ_t2)  (contact-local frame)
     //
-    //  ── Jacobian cache ──────────────────────────────────────────────────────────
+    //  ── MONOTONIC RESIZE ─────────────────────────────────────────────────────
     //
-    //  arm_A = +r₁·n̂  (contact-to-centreline vector for Beam-1 frames)
-    //  arm_B = −r₂·n̂  (contact-to-centreline vector for Beam-2 frames)
-    //
-    //  Ṗc_A = Σ_b w_b · [v_b + ω_b × arm_A]
-    //  Ṗc_B = Σ_b w_b · [v_b + ω_b × arm_B]
-    //  δ̇    = Ṗc_B − Ṗc_A  (gap velocity, mode = "gap")
-    // ─────────────────────────────────────────────────────────────────────────────
+    //  storeLambda writes back to the output MOs using DOF indices registered at
+    //  AnimateBeginEvent.  If SSIM detects K_free < K_n during the free-motion
+    //  phase and BCM shrinks the output MO, storeLambda accesses out-of-bounds
+    //  slots → SIGSEGV.  Fix: only grow the MO, never shrink.  Stale slots beyond
+    //  the active K have no mechanical effect.
+    // ─────────────────────────────────────────────────────────────────────────
     void BeamContactMapping::apply(
         const sofa::core::MechanicalParams* /*mparams*/,
         const sofa::type::vector<sofa::core::objectmodel::Data<OutVecCoord>*>&
@@ -163,6 +183,13 @@ namespace Cosserat
         const sofa::type::vector<const sofa::core::objectmodel::Data<In2VecCoord>*>&
         dataVecIn2Pos)
     {
+        if (!l_ssim.get())
+        {
+            msg_error() << "apply(): l_ssim is null — cannot fetch SSIM outputs. "
+                           "Aborting. Check that ssim='@...' is set in the scene.";
+            return;
+        }
+        
         if (dataVecIn1Pos.empty() || dataVecIn2Pos.empty() || dataVecOutPos.empty())
             return;
 
@@ -170,44 +197,86 @@ namespace Cosserat
             frames1 = *dataVecIn1Pos[0];
         sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<In2VecCoord>>
             frames2 = *dataVecIn2Pos[0];
+        
+        const bool  algo2  = l_ssim->isAlgo2();
+        const int   K      =  static_cast<int>(l_ssim->getNumContacts()); 
 
-        const auto& ids = d_contactSectionIds.getValue();
-        const auto& params = d_curvilinearParams.getValue();
-        const Real  r1 = d_radius1.getValue();
-        const Real  r2 = d_radius2.getValue();
-        const bool  algo2 = d_isAlgo2.getValue();
-
-        const int K = static_cast<int>(std::min(ids.size(), params.size()));
-
-        if (ids.size() != params.size())
-            msg_warning() << "contactSectionIds (" << ids.size()
-            << ") and curvilinearParams (" << params.size()
-            << ") have different sizes. Using K=" << K << ".";
-
-        m_jacCache.resize(static_cast<sofa::Size>(K));
+        
+        if (static_cast<int>(m_jacCache.size()) != K)
+            m_jacCache.resize(static_cast<sofa::Size>(K));
 
         const int N1 = static_cast<int>(frames1.size());
         const int N2 = static_cast<int>(frames2.size());
+        const auto& params = l_ssim->d_curvilinearParams.getValue();
+        
+        constexpr Real kInvalidGap = Real(1e9);
+        
+        bool beam1IsNode = false;
+        bool beam2IsNode = false;
+        
+        if (algo2 && K > 0)
+        {
+            bool anyS1Positive = false;
+            bool anyS2Positive = false;
+            for (int k = 0; k < K; ++k)
+            {
+                const Vec2d cp = params[k];
+                if (cp[0] > s_eps) anyS1Positive = true;
+                if (cp[1] > s_eps) anyS2Positive = true;
+                if (anyS1Positive && anyS2Positive) break;  // inconsistent, reported below
+            }
 
-        // ── Per-contact geometry computation (shared by both modes) ──────────────
+            if (anyS1Positive && !anyS2Positive)
+            {
+                // Beam-1 has a segment parameter → Beam-2 is the node side.
+                beam2IsNode = true;
+            }
+            else if (!anyS1Positive && anyS2Positive)
+            {
+                beam1IsNode = true;
+            }
+            else if (!anyS1Positive && !anyS2Positive)
+            {
+                // Every pair sits exactly on a segment endpoint on both sides.
+                // Both interpretations give numerically identical Jacobians
+                // (the other block has weight 0). Default to Beam-1 is node.
+                beam1IsNode = true;
+            }
+            else
+            {
+                // anyS1Positive && anyS2Positive: violates SSIM's ALGO_2 contract.
+                msg_error() << "apply(): ALGO_2 reports both s1>0 and s2>0 across "
+                               "contact pairs. SSIM should produce s==0 on exactly "
+                               "one side (the node side). Check SSIM::doUpdate(). "
+                               "Defaulting to Beam-1 is node.";
+                beam1IsNode = true;
+            }
+        }
+
+        // ── Per-contact geometry ──────────────────────────────────────────────
         //
-        // Extracted into a lambda so it can be called identically from each branch
-        // without duplicating the 60-line loop.  The lambda writes Pc_A/Pc_B and
-        // the Jacobian cache entry; the caller decides which output slot to fill.
+        // computeGeom fills m_jacCache[k] with:
+        //   - Jacobian blocks (frameIdx, weight, arm) for both beams
+        //   - contact normal    → entry.normal   (from SSIM)
+        //   - tangent t̂₁        → entry.tangent1 (from SSIM) 
+        //   - tangent t̂₂        → entry.tangent2 (from SSIM)  
         //
-        // Returns false if the contact pair is out of range (caller writes zeros).
-        struct ContactGeom { Vec3 Pc_A, Pc_B; };
+        // NOTHING is recomputed that SSIM already provides.
+        struct ContactGeom { Vec3 Pc_A, Pc_B, n; };
 
         auto computeGeom = [&](int k) -> std::pair<bool, ContactGeom>
             {
-                const int  i = ids[k][0];
-                const int  j = ids[k][1];
-                const Real alpha = params[k][0];
-                const Real beta = params[k][1];
+                const Vec2i sec = l_ssim->getContactSectionIds(k); 
+                const int  i     = sec[0];
+                const int  j     = sec[1];
+                const Vec2d cp    = params[k];   
+                const Real alpha = cp[0];
+                const Real beta  = cp[1];
 
-                const bool b1Valid = algo2 ? (i >= 0 && i < N1)
-                    : (i >= 0 && i + 1 < N1);
-                const bool b2Valid = (j >= 0 && j + 1 < N2);
+                const bool b1Valid = beam1IsNode ? (i >= 0 && i     < N1)
+                                         : (i >= 0 && i + 1 < N1);
+                const bool b2Valid = beam2IsNode ? (j >= 0 && j     < N2)
+                                             : (j >= 0 && j + 1 < N2);
 
                 if (!b1Valid || !b2Valid)
                 {
@@ -219,112 +288,102 @@ namespace Cosserat
                     return { false, {} };
                 }
 
-                // Beam-1 centreline point P_A
-                Vec3 P_A;
-                if (algo2)
-                    P_A = frames1[i].getCenter();
-                else
-                    P_A = frames1[i].getCenter() * (Real(1) - alpha)
-                    + frames1[i + 1].getCenter() * alpha;
+                // ── Surface contact points from SSIM ────────────────────────
+                // Pc_A and Pc_B are fully computed by SSIM (correct radii,
+                // external vs. nested CTR mode).  No recomputation here.
+                const Vec3 Pc_A = l_ssim->getSurfacePoint1(k);
+                const Vec3 Pc_B = l_ssim->getSurfacePoint2(k);
 
-                // Beam-2 centreline point P_B
-                const Vec3 P_B = frames2[j].getCenter() * (Real(1) - beta)
-                    + frames2[j + 1].getCenter() * beta;
+                // ── Contact normal from SSIM ────────────────────────────────
+                // getContactNormal() returns the cached value from doUpdate().
+                // SSIM owns the full zero-normal fallback chain.
+                const Vec3 n = l_ssim->getContactNormal(k);
 
-                // Contact normal n̂ = (P_B − P_A) / ‖P_B − P_A‖
-                Vec3 n = P_B - P_A;
-                const Real dn = n.norm();
-                if (dn < s_eps)
-                {
-                    Vec3 tangent = frames1[i].getOrientation().rotate(Vec3(1, 0, 0));
-                    Vec3 cand[3] = { {1,0,0},{0,1,0},{0,0,1} }; //todo: change in later version
-                    int bestIdx = 0;
-                    for (int c = 1; c < 3; ++c)
-                        if (std::abs(dot(cand[c], tangent)) < std::abs(dot(cand[bestIdx], tangent)))
-                            bestIdx = c;
-                    n = cross(tangent, cand[bestIdx]);
-                    n.normalize();
-                }
-                else
-                {
-                    n /= dn;
-                }
+                // ── Contact-frame tangents from SSIM ───────────────────────
+                // Previously: BCM computed t̂₁/t̂₂ by projecting the Beam-1 chord onto
+                // the contact plane — exactly what SSIM already does in doUpdate().
+                // Now: read directly from the pre-fetched arrays.  Zero recomputation.
+                const Vec3 t1 =l_ssim->getContactTangent1(k);
+                const Vec3 t2 = l_ssim->getContactTangent2(k);
 
-                // Surface points
-                const Vec3 Pc_A = P_A + n * r1;   // Beam-1 surface toward Beam-2
-                const Vec3 Pc_B = P_B - n * r2;   // Beam-2 surface toward Beam-1
-
-                // Jacobian cache
-                const Vec3 p_i = frames1[i].getCenter();
-                const Vec3 p_j = frames2[j].getCenter();
-                const Vec3 p_jp1 = frames2[j + 1].getCenter();
-
-                const Vec3 armA1 = Pc_A - p_i;
-
-                const Vec3 armB1 = Pc_B - p_j;
-                const Vec3 armB2 = Pc_B - p_jp1;
+                // ── Moment arms ───────────────────────────────────────────────
+                // arm = contact_surface_point − frame_centre
+                // These are the only quantities BCM computes that SSIM does not export,
+                // because they depend on the input-MO frame centres passed to apply().
+                const Vec3 p_i   = frames1[i].getCenter();
+                const Vec3 p_j   = frames2[j].getCenter();
 
                 ContactJacEntry& entry = m_jacCache[k];
-                if (algo2)
+
+                if (beam1IsNode)
                 {
                     entry.nBeam1Blocks = 1;
-                    entry.beam1Blocks[0] = { i, Real(1), armA1 };
+                    entry.beam1Blocks[0] = { i, Real(1), Pc_A - p_i };
                 }
                 else
                 {
                     const Vec3 p_ip1 = frames1[i + 1].getCenter();
-                    const Vec3 armA2 = Pc_A - p_ip1;
                     entry.nBeam1Blocks = 2;
-                    entry.beam1Blocks[0] = { i,     Real(1) - alpha, armA1 };
-                    entry.beam1Blocks[1] = { i + 1, alpha,           armA2 };
+                    entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - p_i   };
+                    entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - p_ip1 };
                 }
-                entry.nBeam2Blocks = 2;
-                entry.beam2Blocks[0] = { j,     Real(1) - beta, armB1 };
-                entry.beam2Blocks[1] = { j + 1, beta,           armB2 };
+            
+                if (beam2IsNode)
+                {
+                    entry.nBeam2Blocks = 1;
+                    entry.beam2Blocks[0] = { j, Real(1), Pc_B - p_j };
+                }
+                else
+                {
+                    const Vec3 p_jp1 = frames2[j + 1].getCenter();
+                    entry.nBeam2Blocks = 2;
+                    entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - p_j   };
+                    entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - p_jp1 };
+                }
 
-                return { true, { Pc_A, Pc_B } };
+                // Store contact frame for applyJ / applyJT.
+                entry.normal   = n;
+                entry.tangent1 = t1;  
+                entry.tangent2 = t2; 
+
+                return { true, { Pc_A, Pc_B, n } };
             };
 
-        // ── MONOTONIC RESIZE: never shrink the output MOs ────────────────────────
-        //
-        // storeLambda (called by FreeMotionAnimationLoop after the constraint solve)
-        // writes back the resolved multiplier λ to each output MO using the DOF
-        // indices that ContactFeeder registered at AnimateBeginEvent (indices 0..K_n-1).
-        //
-        // apply() is called a second time during the free-motion phase with the
-        // integrated positions.  If SSIM detects K_free < K_n contact pairs in
-        // the free-motion configuration, resizing to K_free would leave the MOs
-        // smaller than what storeLambda expects: writing to index k ≥ K_free is
-        // an out-of-bounds access → SIGSEGV.
-        //
-        // Fix: only grow the MOs, never shrink them.  Slots beyond the current K
-        // retain stale data, but ContactFeeder only registers k < K_n contacts, so
-        // storeLambda only accesses valid slots.  The ULC violation is only computed
-        // for the active k range, so stale slots have no mechanical effect.
-
-        // MODIFIED: contactPoints mode output size is now 2K (interleaved), not K.
-        // Both modes share the single-output-MO path; only the slot count differs.
+        // ── Write output positions (monotonic resize only — never shrink) ─────
         const sofa::Size newK = static_cast<sofa::Size>(K);
 
         if (isGapMode())
         {
-            // ── Gap mode: δ = Pc_B − Pc_A ──────────
+            // ── Gap mode: δ = Vec3(δ_n, δ_t1, δ_t2) in contact-local frame ──
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecCoord>>
                 outGap = *dataVecOutPos[0];
             if (outGap.size() < newK) outGap.resize(newK);
-
             for (int k = 0; k < K; ++k)
             {
                 auto [ok, g] = computeGeom(k);
-                if (!ok) continue;
-                outGap[k] = g.Pc_B - g.Pc_A;
+                if (!ok) 
+                { 
+                    outGap[k] = Vec3(kInvalidGap, Real(0), Real(0));
+                    m_jacCache[k].gapNormal   = kInvalidGap;
+                    m_jacCache[k].gapTangent1 = Real(0);
+                    m_jacCache[k].gapTangent2 = Real(0);
+                    continue;
+                }
+                
+                const Vec3 d = l_ssim->getDistances(k); 
+                m_jacCache[k].gapNormal   = d[0];        
+                m_jacCache[k].gapTangent1 = d[1];      
+                m_jacCache[k].gapTangent2 = d[2];      
+                
+                outGap[k] = Vec3(
+                    m_jacCache[k].gapNormal,    
+                    m_jacCache[k].gapTangent1,
+                    m_jacCache[k].gapTangent2);
             }
         }
         else
         {
-            // ── contactPoints mode: single interleaved output MO ─────────────────
-            //    out[0][2k]   = Pc_A[k]   (even index → Beam-1 surface point)
-            //    out[0][2k+1] = Pc_B[k]   (odd  index → Beam-2 surface point)
+            // ── contactPoints mode: single interleaved output MO ─────────────
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecCoord>>
                 out = *dataVecOutPos[0];
 
@@ -334,11 +393,56 @@ namespace Cosserat
             for (int k = 0; k < K; ++k)
             {
                 auto [ok, g] = computeGeom(k);
-                if (!ok) continue;
+                if (!ok)
+                {   
+                    out[2 * k]     = Vec3(Real(0), Real(0), Real(0));
+                    out[2 * k + 1] = Vec3(Real(0), Real(0), Real(0));
+                    m_jacCache[k].gapNormal   = kInvalidGap;
+                    m_jacCache[k].gapTangent1 = Real(0);
+                    m_jacCache[k].gapTangent2 = Real(0);
+                    continue;
+                }
+                const Vec3 d = l_ssim->getDistances(k); 
+                m_jacCache[k].gapNormal   = d[0];        
+                m_jacCache[k].gapTangent1 = d[1];      
+                m_jacCache[k].gapTangent2 = d[2]; 
                 out[2 * k]     = g.Pc_A;
                 out[2 * k + 1] = g.Pc_B;
             }
         }
+        
+        
+        auto triads = sofa::helper::getWriteOnlyAccessor(d_contactTriads);
+        auto dists  = sofa::helper::getWriteOnlyAccessor(d_distances);
+        if (triads.size() < newK) triads.resize(newK);  
+        if (dists.size()   < newK) dists.resize(newK);
+        for (int k = 0; k < K; ++k)
+        {
+            if (m_jacCache[k].nBeam1Blocks == 0 || m_jacCache[k].nBeam2Blocks == 0)
+            {
+                triads[k] = ContactTriad{};      // value-initialized: all zeros
+                dists[k]  = Vec3(kInvalidGap, Real(0), Real(0));
+                continue;
+            }
+            triads[k].n  = m_jacCache[k].normal;
+            triads[k].t1 = m_jacCache[k].tangent1;
+            triads[k].t2 = m_jacCache[k].tangent2;
+
+            dists[k] = Vec3(m_jacCache[k].gapNormal,
+                            m_jacCache[k].gapTangent1,
+                            m_jacCache[k].gapTangent2);
+
+        }
+        
+        // scrub the stale tail left over from earlier steps when
+        // K_now < K_max. Keeps the vector monotonic in size (storeLambda safety)
+        // but forces the content to a state CPULC's n̂≈0 filter recognizes as
+        // "no contact here".
+        for (sofa::Size k = static_cast<sofa::Size>(K); k < triads.size(); ++k)
+        {
+            triads[k] = ContactTriad{};                                  // n = t1 = t2 = 0
+            dists[k]  = Vec3(kInvalidGap, Real(0), Real(0));             // δn = +∞ → cleared
+        }        
     }
 
 
@@ -373,10 +477,12 @@ namespace Cosserat
         sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<In2VecDeriv>>
             vel2 = *dataVecIn2Vel[0];
 
-        const int  K = static_cast<int>(m_jacCache.size()); //todo: why not computed from calling params?
+        const int  K = static_cast<int>(m_jacCache.size());
         const sofa::Size newK = static_cast<sofa::Size>(K);
         const bool gapMode = isGapMode();
-
+        const Real s = l_ssim->gapSignForPublishedNormal();
+        d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
+        
         if (gapMode)
         {
             // ── Gap mode: single output, δ̇[k] = Ṗc_B[k] − Ṗc_A[k] ───────────────
@@ -407,8 +513,12 @@ namespace Cosserat
                             blk.arm))
                         * blk.weight;
                 }
-
-                outVel[k] = vcB - vcA;   // δ̇[k] = Ṗc_B − Ṗc_A
+                
+                const Vec3 dv = vcB - vcA;
+                outVel[k] = Vec3(
+                    s*(dv * entry.normal),
+                    dv * entry.tangent1,
+                    dv * entry.tangent2);
             }
         }
         else
@@ -456,12 +566,12 @@ namespace Cosserat
     //
     //  Virtual-work principle:  δW = F · δPc = Jᵀ · F
     //
-    //  mode = "contactPoints":                                                    // MODIFIED
-    //    Single interleaved input force vector (size 2K):                         // MODIFIED
-    //    inForce[0][2k]   = FA at Pc_A[k]  →  Beam-1 frames:                    // MODIFIED
-    //      f += w_b·FA,   τ += w_b·(arm_A × FA)                                  // MODIFIED
-    //    inForce[0][2k+1] = FB at Pc_B[k]  →  Beam-2 frames:                    // MODIFIED
-    //      f += w_b·FB,   τ += w_b·(arm_B × FB)                                  // MODIFIED
+    //  mode = "contactPoints":                                                  
+    //    Single interleaved input force vector (size 2K):                      
+    //    inForce[0][2k]   = FA at Pc_A[k]  →  Beam-1 frames:                   
+    //      f += w_b·FA,   τ += w_b·(arm_A × FA)                                 
+    //    inForce[0][2k+1] = FB at Pc_B[k]  →  Beam-2 frames:                  
+    //      f += w_b·FB,   τ += w_b·(arm_B × FB)                                 
     //
     //  mode = "gap":
     //    inForce[0][k] = F at gap DOF  →  both beams:
@@ -487,6 +597,8 @@ namespace Cosserat
 
         const int  K = static_cast<int>(m_jacCache.size());
         const bool gapMode = isGapMode();
+        const Real s = l_ssim->gapSignForPublishedNormal();
+        d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
 
         if (gapMode)
         {
@@ -499,7 +611,10 @@ namespace Cosserat
                 if (k >= static_cast<int>(inForce.size())) break;
 
                 const ContactJacEntry& entry = m_jacCache[k];
-                const Vec3 F = inForce[k];
+                
+                const Vec3 F = s * entry.normal   * inForce[k][0]
+                             + entry.tangent1 * inForce[k][1]
+                             + entry.tangent2 * inForce[k][2];
 
                 // Beam-1 receives negative contribution (Ṗc_A has − sign in δ̇).
                 for (int b = 0; b < entry.nBeam1Blocks; ++b)
@@ -567,11 +682,11 @@ namespace Cosserat
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     //  applyJT  (MatrixDeriv)  –  constraint Jacobian assembly
     //
     //  Called by GenericConstraintSolver during the free-motion phase to build
-    //  the per-constraint Jacobian rows that will be passed to the LCP/QP solver.
+    //  the per-constraint Jacobian rows passed to the LCP/QP solver.
     //
     //  mode = "contactPoints":
     //    Single input constraint matrix (from the one output MO).
@@ -580,12 +695,21 @@ namespace Cosserat
     //    In1 frame b (Beam-1): w_b·d (translational), w_b·(arm_A × d) (rotational).
     //    In2 frame b (Beam-2): w_b·d (translational), w_b·(arm_B × d) (rotational).
     //
-    //  mode = "gap":
-    //    dataMatIn[0] holds gap constraint rows   → contributed to BOTH matrices.
-    //      col k = contact index, d = constraint direction at gap DOF k.
-    //      In1 frame b: −w_b·d (translational), −w_b·(arm_A × d) (rotational).
-    //      In2 frame b: +w_b·d (translational), +w_b·(arm_B × d) (rotational).
-    // ─────────────────────────────────────────────────────────────────────────────
+    //  mode = "gap":                                                     
+    //    dataMatIn[0] holds gap constraint rows.
+    //    col k = contact index; d = constraint direction in contact-local frame.
+    //    Back-project to world frame:
+    //      d_phys = n̂·d[0] + t̂₁·d[1] + t̂₂·d[2]
+    //    Then:
+    //      In1 frame b: −w_b·d_phys (translational), −w_b·(arm_A × d_phys) (rotational).
+    //      In2 frame b: +w_b·d_phys (translational), +w_b·(arm_B × d_phys) (rotational).
+    //
+    //    For DistanceUnilateralLagrangianConstraint, d = Vec3(1,0,0)
+    //    → d_phys = n̂ (same as the old single-component implementation).
+    //    Friction constraints writing Vec3(0,1,0) / Vec3(0,0,1) get t̂₁ / t̂₂.
+    //
+    //    Previously: d_phys = entry.normal * colIt.val()[0]  — only [0] used.
+    // ─────────────────────────────────────────────────────────────────────────
     void BeamContactMapping::applyJT(
         const sofa::core::ConstraintParams* /*cparams*/,
         const sofa::type::vector<sofa::core::objectmodel::Data<In1MatrixDeriv>*>&
@@ -602,6 +726,9 @@ namespace Cosserat
             outM1 = *dataMatOut1[0];
         sofa::helper::WriteAccessor<sofa::core::objectmodel::Data<In2MatrixDeriv>>
             outM2 = *dataMatOut2[0];
+        
+        const Real s = l_ssim->gapSignForPublishedNormal();
+        d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
 
         const int  K = static_cast<int>(m_jacCache.size());
         const bool gapMode = isGapMode();
@@ -625,8 +752,11 @@ namespace Cosserat
                     const int k = static_cast<int>(colIt.index());
                     if (k < 0 || k >= K) continue;
 
-                    const Vec3 d = colIt.val();
                     const ContactJacEntry& entry = m_jacCache[k];
+                    
+                    const Vec3 d = s * entry.normal   * colIt.val()[0]
+                                + entry.tangent1 * colIt.val()[1]
+                                + entry.tangent2 * colIt.val()[2];
 
                     // Beam-1: negative Jacobian block (Ṗc_A enters with − in δ̇).
                     for (int b = 0; b < entry.nBeam1Blocks; ++b)
@@ -708,7 +838,6 @@ namespace Cosserat
     // ─────────────────────────────────────────────────────────────────────────────
     void registerBeamContactMapping(sofa::core::ObjectFactory* factory)
     {
-        std::cerr << ">>> [BCM] registerBeamContactMapping called" << std::endl;
         factory->registerObjects(sofa::core::ObjectRegistrationData(
             "Maps SSIM contact-point descriptors (section IDs + curvilinear parameters) "
             "to two sets of Cosserat beam Rigid3d frames.\n"
@@ -719,7 +848,6 @@ namespace Cosserat
             "out[0][2k]=Pc_A (Beam-1 surface), out[0][2k+1]=Pc_B (Beam-2 surface). "
             "applyJT: even force/column indices -> Beam-1, odd -> Beam-2.\n"
             "  'gap': output size = K. "
-            "out[0][k] = Pc_B[k]-Pc_A[k] = (d-r1-r2)*n (gap vector). "
             "applyJ gives gap velocity; applyJT back-projects with opposite signs to each beam.\n"
             "Supports ALGO_1 (segment-to-segment) and ALGO_2 (node-to-segment).\n"
             "Implements apply / applyJ / applyJT(VecDeriv) / applyJT(MatrixDeriv) "

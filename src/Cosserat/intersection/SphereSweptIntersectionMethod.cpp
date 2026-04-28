@@ -1,0 +1,1309 @@
+/******************************************************************************
+ * Cosserat Plugin for SOFA Framework                                         *
+ *                                                                            *
+ * SphereSweptIntersectionMethod.cpp                                          *
+ *                                                                            *
+ * See SphereSweptIntersectionMethod.h for full documentation.               *
+ ******************************************************************************/
+#include "SphereSweptIntersectionMethod.h"
+
+#include <sofa/core/ObjectFactory.h>
+#include <sofa/helper/accessor.h>
+#include <algorithm>
+
+namespace Cosserat {
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  Constructor
+    // ─────────────────────────────────────────────────────────────────────────────
+    SphereSweptIntersectionMethod::SphereSweptIntersectionMethod()
+        : Inherit1()
+        //
+        // ── Inputs ────────────────────────────────────────────────────────────
+        , d_beam1Frames(initData(&d_beam1Frames, VecRigidCoord{},
+            "beam1Frames",
+            "Rigid3d frames of Beam 1 (FramesMO output of DiscreteCosseratMapping)."))
+        , d_beam2Frames(initData(&d_beam2Frames, VecRigidCoord{},
+            "beam2Frames",
+            "Rigid3d frames of Beam 2 (FramesMO output of DiscreteCosseratMapping)."))
+        , d_beam1Velocities(initData(&d_beam1Velocities, VecRigidDeriv{},
+            "beam1Velocities",
+            "Rigid3d frame velocities of Beam 1 (FramesMO.velocity). "
+            "Link via beam1Velocities=beam1_MO.getLinkPath()+'.velocity'."))
+        , d_beam2Velocities(initData(&d_beam2Velocities, VecRigidDeriv{},
+            "beam2Velocities",
+            "Rigid3d frame velocities of Beam 2 (FramesMO.velocity). "
+            "Same rules as beam1Velocities."))
+        , d_radius1(initData(&d_radius1, Real(0.1),
+            "radius1",
+            "Outer cross-section radius of Beam 1."))
+        , d_radius2(initData(&d_radius2, Real(0.1),
+            "radius2",
+            "Outer cross-section radius of Beam 2."))
+        , d_innerRadius1(initData(&d_innerRadius1, Real(0.0),
+            "innerRadius1",
+            "Inner radius of Beam 1. 0 = solid beam (external contact). "
+            ">0 = hollow tube (CTR nesting). "
+            "Beam 1 is the CTR outer tube when radius1 > radius2."))
+        , d_innerRadius2(initData(&d_innerRadius2, Real(0.0),
+            "innerRadius2",
+            "Inner radius of Beam 2. 0 = solid beam (external contact). "
+            ">0 = hollow tube (CTR nesting). "
+            "Beam 2 is the CTR outer tube when radius2 > radius1."))
+        , d_algorithmType(initData(&d_algorithmType,
+            sofa::helper::OptionsGroup({ "ALGO_1", "ALGO_2" }),
+            "algorithmType",
+            "Contact detection algorithm. "
+            "ALGO_1 = segment-to-segment (Ericson 2005 §5.1.9). "
+            "ALGO_2 = node-to-segment (exact closed-form projection)."))
+        , d_contactConfiguration(initData(&d_contactConfiguration,
+            sofa::helper::OptionsGroup({ "external", "nested" }),
+            "contactConfiguration",
+            "Contact geometry mode. "
+            "'external': always side-by-side; gap = dist-(r1+r2). "
+            "'nested': always coaxial (CTR); gap = ri_outer-r_outer_inner-dist. "
+            "  One-time init check: ri_outer > r_outer_inner must hold. "
+            "  defaultNormal MUST be set to a vector perpendicular to the beam axis."))
+        , d_broadPhaseMarginFactor(initData(&d_broadPhaseMarginFactor, Real(1.5),
+            "broadPhaseMarginFactor",
+            "Multiplier on each beam's contact-relevant radius for bounding-sphere broad-phase. "
+            "External: R_i = halfLen_i + factor*r_outer_i. "
+            "Nested (outer tube): R_i = halfLen_i + factor*ri_outer_i (bore). "
+            "Nested (inner tube): R_i = halfLen_i + factor*r_outer_i. "
+            "Default 1.5. For nested CTR beams all segments pass (correct)."))
+        , d_defaultNormal(initData(&d_defaultNormal, Vec3(0,0,0),
+            "defaultNormal",
+            "Fallback contact normal for degenerate cases (coincident + parallel beams "
+            "with no prior valid normal). Must be set by the user. "
+            "If left as (0,0,0) the contact pair is skipped with an error. "
+            "REQUIRED for nested CTR scenes (centrelines nearly coincident by design). "
+            "Use a vector perpendicular to the nominal beam axis (e.g. '0 1 0')."))
+        , d_cachedNormalMaxAxialProjection(initData(&d_cachedNormalMaxAxialProjection, 
+            Real(0.17),
+            "cachedNormalMaxAxialProjection",
+            "Tolerance on |n_cached . tangent| for cached-normal perpendicularity test. "
+            "A cached normal is rejected if its projection on either segment tangent "
+            "exceeds this value. Default 0.17 ~ sin(10 deg)."))
+        , d_cachedNormalMaxFrameRotation(initData(&d_cachedNormalMaxFrameRotation,     
+            Real(3.14159265358979323846/ 18.0),
+            "cachedNormalMaxFrameRotation",
+            "Tolerance (in radians) on the angular change of the SLERP'd contact-point "
+            "frame since the cached normal was stored. Default pi/18 ~ 10 deg."))
+        // ── Outputs ───────────────────────────────────────────────────────────
+        , d_curvilinearParams(initData(&d_curvilinearParams,
+            "curvilinearParams",
+            "Normalised curvilinear parameters {s1*, s2*} per contact pair. "
+            "Always refers to original beam numbering. "
+            "ALGO_2: the node-side beam has parameter 0."))
+    {
+        sofa::helper::OptionsGroup algoOptions({ "ALGO_1", "ALGO_2" });
+        algoOptions.setSelectedItem(0u); // default: ALGO_1
+        d_algorithmType.setValue(algoOptions);
+
+        sofa::helper::OptionsGroup cfgOptions({ "external", "nested" }); 
+        cfgOptions.setSelectedItem(0u); // default: "external"
+        d_contactConfiguration.setValue(cfgOptions);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  SOFA lifecycle
+    // ─────────────────────────────────────────────────────────────────────────────
+    void SphereSweptIntersectionMethod::init()
+    {
+        addInput(&d_beam1Frames);
+        addInput(&d_beam2Frames);
+        addInput(&d_radius1);
+        addInput(&d_radius2);
+        addInput(&d_innerRadius1);
+        addInput(&d_innerRadius2);
+        addInput(&d_algorithmType);
+        addInput(&d_contactConfiguration);
+        addInput(&d_broadPhaseMarginFactor);
+        addInput(&d_defaultNormal);
+        addInput(&d_beam1Velocities);  
+        addInput(&d_beam2Velocities); 
+
+        addOutput(&d_curvilinearParams);
+        
+        Inherit1::init();
+       	validateParameters();
+        setDirtyValue();
+    }
+
+    void SphereSweptIntersectionMethod::reinit()
+    {
+        if (!validateParameters())
+            return;
+        update();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+//  validateParameters
+//
+//  Runs every parameter-consistency check. Sets d_componentState to Invalid on
+//  failure and returns false. Clears m_lastValidNormal because cached normals
+//  keyed by (i,j) section-pair indices may be stale after topology changes.
+//  Called by init() (after addInput/addOutput) and reinit().
+// ─────────────────────────────────────────────────────────────────────────────
+bool SphereSweptIntersectionMethod::validateParameters()
+{
+    // Reset state; failure branches set it to Invalid.
+    d_componentState.setValue(sofa::core::objectmodel::ComponentState::Valid);
+
+    // Drop cache — geometry/topology may have changed since last validation.
+    m_lastValidNormal.clear();
+
+    // ── defaultNormal check ──────────────────────────────────────────────
+    if (d_defaultNormal.getValue().norm() < s_eps)
+    {
+        const std::string cfg =
+            d_contactConfiguration.getValue().getSelectedItem();
+        if (cfg == "nested")
+        {
+            msg_error() << "contactConfiguration='nested' requires 'defaultNormal' "
+                           "to be a non-zero vector perpendicular to the beam axis.";
+            d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+            return false;
+        }
+        else
+        {
+            msg_warning() << "'defaultNormal' is zero. Used only as last-resort "
+                             "fallback for coincident+parallel beams.";
+        }
+    }
+
+    if (!d_beam1Frames.getParent() || !d_beam2Frames.getParent())
+    {
+        msg_error() << "beam1Frames and beam2Frames must be linked to a MechanicalObject.";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+    if (d_radius1.getValue() <= Real(0) || d_radius2.getValue() <= Real(0))
+    {
+        msg_error() << "radius1 and radius2 must be strictly positive.";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+    if (!d_beam1Velocities.getParent())
+    {
+        msg_error() << "'beam1Velocities' is MANDATORY. Link via "
+                       "beam1Velocities=<beam1_framesMO>.getLinkPath()+'.velocity'.";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+    if (!d_beam2Velocities.getParent())
+    {
+        msg_error() << "'beam2Velocities' is MANDATORY. Link via "
+                       "beam2Velocities=<beam2_framesMO>.getLinkPath()+'.velocity'.";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+
+    sofa::helper::ReadAccessor<sofa::Data<VecRigidCoord>> f1 = d_beam1Frames;
+    sofa::helper::ReadAccessor<sofa::Data<VecRigidCoord>> f2 = d_beam2Frames;
+    sofa::helper::ReadAccessor<sofa::Data<VecRigidDeriv>> v1 = d_beam1Velocities;
+    sofa::helper::ReadAccessor<sofa::Data<VecRigidDeriv>> v2 = d_beam2Velocities;
+
+    if (v1.size() != f1.size() || v2.size() != f2.size())
+    {
+        msg_error() << "Velocity array size does not match frame array size "
+                       "(beam1: " << v1.size() << " vs " << f1.size()
+                    << ", beam2: " << v2.size() << " vs " << f2.size() << ").";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+
+    if (d_innerRadius1.getValue() < Real(0) || d_innerRadius2.getValue() < Real(0))
+    {
+        msg_error() << "innerRadius1 and innerRadius2 must be non-negative.";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+    if (d_innerRadius1.getValue() > Real(0) &&
+        d_innerRadius1.getValue() >= d_radius1.getValue())
+    {
+        msg_error() << "innerRadius1 (" << d_innerRadius1.getValue()
+                    << ") must be strictly less than radius1 ("
+                    << d_radius1.getValue() << ").";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+    if (d_innerRadius2.getValue() > Real(0) &&
+        d_innerRadius2.getValue() >= d_radius2.getValue())
+    {
+        msg_error() << "innerRadius2 (" << d_innerRadius2.getValue()
+                    << ") must be strictly less than radius2 ("
+                    << d_radius2.getValue() << ").";
+        d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+        return false;
+    }
+
+    // ── Nested geometry consistency ──────────────────────────────────────
+    const std::string cfg = d_contactConfiguration.getValue().getSelectedItem();
+    if (cfg == "nested")
+    {
+        const Real r1  = d_radius1.getValue(),      r2  = d_radius2.getValue();
+        const Real ri1 = d_innerRadius1.getValue(), ri2 = d_innerRadius2.getValue();
+        const bool beam1IsOuter  = (r1 >= r2);
+        const Real r_bore        = beam1IsOuter ? ri1 : ri2;
+        const Real r_outer_inner = beam1IsOuter ? r2  : r1;
+        const int  outerBeamId   = beam1IsOuter ? 1   : 2;
+
+        if (r_bore <= Real(0))
+        {
+            msg_error() << "contactConfiguration='nested': Beam " << outerBeamId
+                        << " is the outer tube but its innerRadius is 0. "
+                           "Set innerRadius" << outerBeamId << " > 0.";
+            d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+            return false;
+        }
+        if (r_outer_inner >= r_bore)
+        {
+            msg_error() << "contactConfiguration='nested': inner tube outer radius ("
+                        << r_outer_inner << ") >= outer tube bore (" << r_bore
+                        << "). Inner tube cannot fit at construction.";
+            d_componentState.setValue(sofa::core::objectmodel::ComponentState::Invalid);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  doUpdate  – main entry point
+    // ─────────────────────────────────────────────────────────────────────────────
+    void SphereSweptIntersectionMethod::doUpdate()
+    {   
+        // ── Write-accessors for outputs ──────────────────────────────────────────
+        sofa::helper::WriteOnlyAccessor<sofa::Data<sofa::type::vector<sofa::type::Vec2d>>>
+            outParams = d_curvilinearParams;
+        
+        m_distances.clear();         
+        m_centerlinePoints1.clear();  
+        m_centerlinePoints2.clear(); 
+        m_surfacePoints1.clear();     
+        m_surfacePoints2.clear();     
+        m_contactSectionIds.clear();    
+        m_contactNormals.clear();
+        m_contactTangents1.clear();
+        m_contactTangents2.clear();
+
+        outParams.clear();
+        
+        if (this->d_componentState.getValue() ==
+        sofa::core::objectmodel::ComponentState::Invalid)
+        {
+            return;
+        }
+        
+        // ── Read inputs ──────────────────────────────────────────────────────────
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidCoord>> frames1 = d_beam1Frames;
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidCoord>> frames2 = d_beam2Frames;
+        
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidDeriv>> vels1 = d_beam1Velocities;
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidDeriv>> vels2 = d_beam2Velocities;
+
+        // dt is needed to convert tangential velocity → tangential displacement.
+        const Real dt_sim = static_cast<Real>(getContext()->getDt());
+
+        const Real r1     = d_radius1.getValue();
+        const Real r2     = d_radius2.getValue();
+        const Real ri1    = d_innerRadius1.getValue();
+        const Real ri2    = d_innerRadius2.getValue();
+        const Real margin = d_broadPhaseMarginFactor.getValue();
+        const bool useAlgo2 =
+            (d_algorithmType.getValue().getSelectedItem() == std::string("ALGO_2"));
+
+        const int N1 = static_cast<int>(frames1.size());
+        const int N2 = static_cast<int>(frames2.size());
+
+        if (N1 < 2 || N2 < 2)
+        {
+            msg_warning() << "Need at least 2 frames per beam. "
+                "Beam1 has " << N1 << ", Beam2 has " << N2 << ".";
+            return;
+        }
+
+        // ── Contact configuration ────────────────────────────────────────────────
+        //
+        // "external": always side-by-side, regardless of radii.
+        //    gap = dist − (r1 + r2).
+        //
+        // "nested": always coaxial (CTR). The beam with the larger outer radius is
+        //    the outer tube (determined once here, never changes per segment).
+        //    gap = ri_outer − r_outer_inner − dist.
+        //    Validity already verified in init().
+        //
+        const std::string contactCfg =
+            d_contactConfiguration.getValue().getSelectedItem();
+
+        const bool isNested = (contactCfg == "nested");
+
+        const bool beam1IsOuter  = (r1 >= r2);
+        const Real r_bore        = beam1IsOuter ? ri1 : ri2; // inner radius of outer tube (bore)
+        const Real r_outer_inner = beam1IsOuter ? r2  : r1;  // outer radius of inner tube
+
+        // Gap lambda: takes the centreline distance for the current segment pair.
+        auto computeGap = [&](Real dist) -> Real
+        {
+            if (isNested)
+                return r_bore - r_outer_inner - dist;
+            return dist - (r1 + r2); // "external"
+        };
+       
+
+        // The finer beam (more segments / nodes) drives the outer loop to avoid
+        // missing contacts. When swapped (Beam 2 is finer), the internal segment
+        // roles are swapped but all outputs are re-labelled to the original beam
+        // numbering before being written.
+        const bool useSwapped = (N2 > N1);
+
+        const VecRigidCoord& finerFrames   = useSwapped ? frames2.ref() : frames1.ref();
+        const VecRigidCoord& coarserFrames = useSwapped ? frames1.ref() : frames2.ref();
+        const Real r_finer   = useSwapped ? r2 : r1; // outer radius of finer-mesh beam
+        const Real r_coarser = useSwapped ? r1 : r2; // outer radius of coarser-mesh beam
+        const Real ri_finer  = useSwapped ? ri2 : ri1; // inner radius of finer-mesh beam
+        const Real ri_coarser= useSwapped ? ri1 : ri2; // inner radius of coarser-mesh beam
+
+        const int N_finer   = static_cast<int>(finerFrames.size());
+        const int N_coarser = static_cast<int>(coarserFrames.size());
+
+        // determine whether the finer beam is the outer tube.
+        // This is independent of the finer/coarser distinction (mesh resolution
+        // does not necessarily correlate with tube nesting).
+        const bool finerIsOuter = useSwapped ? !beam1IsOuter : beam1IsOuter;
+
+        // contact-relevant broad-phase radii.
+        // For the outer tube (nested mode), the bore (ri) is the contact surface;
+        // using the outer radius would over-inflate the bounding sphere.
+        // For external mode (or the inner tube in nested mode), use the outer radius.
+        const Real r_bp_query     = (isNested && finerIsOuter)  ? ri_finer   : r_finer;
+        const Real r_bp_candidate = (isNested && !finerIsOuter) ? ri_coarser : r_coarser;
+
+        // compute mapToSurface radii based on contact configuration
+        // and which beam is outer/inner.
+        // mapToSurface formula (using raw Beam-1→Beam-2 normal nHat):
+        //   psurf1 = pint1 + r_map1 * nHat
+        //   psurf2 = pint2 +/- r_map2 * nHat (+ if nested, - otherwise)
+        //
+        // External: outer surfaces face each other → r_map1=r1, r_map2=r2.
+        // Nested (beam1=outer): psurf1 on bore (ri1), psurf2 on outer wall (r2).
+        // Nested (beam1=inner): psurf1 on outer wall (r1), psurf2 on bore (ri2).
+        const Real r_map1 = !isNested       ?  r1      // external: +r1
+                   :  beam1IsOuter   ?  ri1     // nested, B1=outer: +ri1 (bore, on +n̂ side)
+                   :                    -r1;    // nested, B1=inner: −r1  (wall, on −n̂ side)
+
+        const Real r_map2 = !isNested       ?  r2      // external: +r2  (produces −r2·n̂)
+                          :  beam1IsOuter   ?  -r2     // nested, B2=inner: −r2  (so psurf2 = Pb + r2·n̂)
+                          :                    ri2;    // nested, B2=outer: +ri2 (so psurf2 = Pb − ri2·n̂)
+
+        // ─────────────────────────────────────────────────────────────────────────
+        //  ALGO_1 – Segment-to-Segment
+        // ─────────────────────────────────────────────────────────────────────────
+        if (!useAlgo2)
+        {
+            for (int i = 0; i < N_finer - 1; ++i)
+            {
+                const Vec3 p0 = finerFrames[i].getCenter();
+                const Vec3 p1 = finerFrames[i + 1].getCenter();
+
+                // Segment tangent: world-space direction of the finer-beam segment i.
+                // Fallback: local X-axis from the frame quaternion (Cosserat convention).
+                const Vec3 seg_tangent_finer = [&]() -> Vec3 {
+                    const Vec3 d = p1 - p0;
+                    const Real dn = d.norm();
+                    return (dn > s_eps) ? d / dn
+                        : finerFrames[i].getOrientation().rotate(Vec3(Real(1), Real(0), Real(0)));
+                }();
+
+                const Vec3 mid_i     = (p0 + p1) * Real(0.5);
+                const Real halfLen_i = (p1 - p0).norm() * Real(0.5);
+
+                // pass contact-relevant broad-phase radii instead of raw outer radii.
+                const auto candidates = candidateSegments(
+                    mid_i, halfLen_i, r_bp_query, coarserFrames, r_bp_candidate, margin);
+
+                Real bestDist = std::numeric_limits<Real>::max();
+                Real best_s_o = Real(0), best_s_i = Real(0);
+                Vec3 best_cp_o, best_cp_i;
+                int  best_j   = -1;
+                bool foundAny = false;
+
+                for (const int j : candidates)
+                {
+                    const Vec3 q0 = coarserFrames[j].getCenter();
+                    const Vec3 q1 = coarserFrames[j + 1].getCenter();
+
+                    Real s_o = Real(0), s_i = Real(0);
+                    Vec3 cp_o, cp_i;
+
+                    segmentToSegment(p0, p1, q0, q1, s_o, s_i, cp_o, cp_i);
+
+                    Real centrelineDist = (cp_o - cp_i).norm();
+                    if (centrelineDist < s_eps)
+                    {
+                        if (!isNested)
+                        {
+                            msg_error() << "ALGO_1: external mode, centerlines coincide at segment pair ("
+                                        << (useSwapped ? j : i) << ","
+                                        << (useSwapped ? i : j)
+                                        << "). This is a real interpenetration.";
+                        }
+                        // use midpoint of the finer segment and project it
+                        // onto the coarser segment.
+                        cp_o = (p0 + p1) * Real(0.5);          // midpoint of finer segment
+                        nodeToSegment(cp_o, q0, q1, s_i, cp_i); // projection onto coarser
+                        s_o  = Real(0.5);
+                        centrelineDist = (cp_o - cp_i).norm();  // may now be > 0
+                    }
+                    
+
+                    if (centrelineDist < bestDist)
+                    {
+                        bestDist    = centrelineDist;
+                        best_s_o   = s_o;
+                        best_s_i   = s_i;
+                        best_cp_o  = cp_o;
+                        best_cp_i  = cp_i;
+                        best_j     = j;
+                        foundAny   = true;
+                    }
+                }
+
+                if (!foundAny) continue;
+                const Real bestGap = computeGap(bestDist);
+
+                // Re-label to original beam-1/beam-2 numbering.
+                const int  idx1   = useSwapped ? best_j : i;
+                const int  idx2   = useSwapped ? i      : best_j;
+                const Vec3 pint1  = useSwapped ? best_cp_i : best_cp_o;
+                const Vec3 pint2  = useSwapped ? best_cp_o : best_cp_i;
+                const Real s1_out = useSwapped ? best_s_i  : best_s_o;
+                const Real s2_out = useSwapped ? best_s_o  : best_s_i;
+
+                const Vec3 q0_best = coarserFrames[best_j].getCenter();
+                const Vec3 q1_best = coarserFrames[best_j + 1].getCenter();
+                const Vec3 seg_tangent_coarser = [&]() -> Vec3 {
+                    const Vec3 d = q1_best - q0_best;
+                    const Real dn = d.norm();
+                    return (dn > s_eps) ? d / dn
+                        : coarserFrames[best_j].getOrientation().rotate(Vec3(Real(1), Real(0), Real(0)));
+                }();
+
+                // Reassign to original beam-1/beam-2 tangents after the swap.
+                const Vec3& t1 = useSwapped ? seg_tangent_coarser : seg_tangent_finer;
+                const Vec3& t2 = useSwapped ? seg_tangent_finer   : seg_tangent_coarser;
+
+                // Compute raw contact normal (always Beam-1 → Beam-2 direction).
+                const Vec3 nHat_raw = computeContactNormal(
+                    pint1, pint2, idx1, idx2, t1, t2,
+                    frames1.ref()[idx1], frames1.ref()[idx1 + 1], s1_out);
+
+                // for nested mode, enforce the outer→inner sign convention
+                // for the output normal, regardless of which beam is Beam-1 or Beam-2.
+                // nHat_raw = Beam-1 → Beam-2.
+                // If Beam-1 is the inner tube (!beam1IsOuter), nHat_raw points inner→outer;
+                // flip it so the reported normal always points outer→inner.
+                // mapToSurface uses nHat_raw (Beam-1→Beam-2) internally — the r_map1/r_map2
+                // values are already chosen to be consistent with this convention.
+                // Previously: no sign flip; output normal was Beam-1→Beam-2 regardless of mode.
+                const Vec3 nHat_out = (isNested && !beam1IsOuter) ? -nHat_raw : nHat_raw;
+                m_contactNormals.push_back(nHat_out);
+
+                // mapToSurface uses correct contact-relevant radii (r_map1, r_map2)
+                // instead of always using the outer radii (r1, r2).
+                // For nested (beam1=outer): r_map1=ri1 (bore), r_map2=r2 (outer wall of inner).
+                // For nested (beam1=inner): r_map1=r1 (outer wall of inner), r_map2=ri2 (bore).
+                // For external: r_map1=r1, r_map2=r2 (unchanged from before).
+                // Previously: mapToSurface(pint1, pint2, nHat, r1, r2, psurf1, psurf2);
+                Vec3 psurf1, psurf2;
+                mapToSurface(pint1, pint2, nHat_raw, r_map1, r_map2, psurf1, psurf2);
+
+                // ── Contact-plane tangent basis ───────────────────────────────────
+                 Vec3 t1_contact, t2_contact;
+       			computeContactFrame(t1 /*tau1*/, t2 /*tau2*/, nHat_out, t1_contact, t2_contact);
+ 
+				m_contactTangents1.push_back(t1_contact);
+        		m_contactTangents2.push_back(t2_contact);
+
+                Real delta_t1 = Real(0);                                             
+                Real delta_t2 = Real(0);                                        
+
+                
+                const int next1 = std::min(idx1 + 1, (int)vels1.size() - 1);
+                const int next2 = std::min(idx2 + 1, (int)vels2.size() - 1);
+
+                // Frame centres (needed for moment arms r = Pa/Pb − p_frame)  
+                const Vec3 pf1_i    = frames1.ref()[idx1].getCenter();
+                const Vec3 pf1_next = frames1.ref()[next1].getCenter();
+                const Vec3 pf2_i    = frames2.ref()[idx2].getCenter();
+                const Vec3 pf2_next = frames2.ref()[next2].getCenter();
+
+                // Angular velocities of the bounding frames             
+                const Vec3 omega1_i    = vels1[idx1].getVOrientation();
+                const Vec3 omega1_next = vels1[next1].getVOrientation();
+                const Vec3 omega2_i    = vels2[idx2].getVOrientation();
+                const Vec3 omega2_next = vels2[next2].getVOrientation();
+
+                // Moment arms: r = contact_point − frame_centre               
+                const Vec3 r1_i    = psurf1 - pf1_i;
+                const Vec3 r1_next = psurf1 - pf1_next;
+                const Vec3 r2_i    = psurf2 - pf2_i;
+                const Vec3 r2_next = psurf2 - pf2_next;
+
+                // ω × r  
+                auto cross = [](const Vec3& a, const Vec3& b) -> Vec3 {
+                    return Vec3(a[1]*b[2] - a[2]*b[1],
+                                a[2]*b[0] - a[0]*b[2],
+                                a[0]*b[1] - a[1]*b[0]);
+                };
+
+                // Full rigid-body velocity at the contact point:               
+                // v_contact = v_centre + ω × r, interpolated across the two    
+                // bounding frames at the contact curvilinear parameter.        
+                // Previously: v_Pa = slerp(v_i, v_{i+1}, s) — angular term omitted 
+                const Vec3 v_Pa =
+                    (vels1[idx1].getVCenter()  + cross(omega1_i,    r1_i))    * (Real(1) - s1_out)
+                  + (vels1[next1].getVCenter() + cross(omega1_next, r1_next)) * s1_out;  
+
+                const Vec3 v_Pb =
+                    (vels2[idx2].getVCenter()  + cross(omega2_i,    r2_i))    * (Real(1) - s2_out)
+                  + (vels2[next2].getVCenter() + cross(omega2_next, r2_next)) * s2_out; 
+
+                const Vec3 v_rel = v_Pb - v_Pa;
+                delta_t1 = (v_rel * t1_contact) * dt_sim;                       
+                delta_t2 = (v_rel * t2_contact) * dt_sim;
+                
+                m_distances.push_back(Vec3(bestGap, delta_t1, delta_t2));
+                m_centerlinePoints1.push_back(pint1);                       
+                m_centerlinePoints2.push_back(pint2);                      
+                m_surfacePoints1.push_back(psurf1);                        
+                m_surfacePoints2.push_back(psurf2);                       
+                m_contactSectionIds.push_back({ idx1, idx2 });       
+                
+                outParams.push_back({ s1_out, s2_out });
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────
+        //  ALGO_2 – Node-to-Segment
+        // ─────────────────────────────────────────────────────────────────────────
+        else
+        {
+            for (int i = 0; i < N_finer; ++i)
+            {
+                const Vec3 nodeP = finerFrames[i].getCenter();
+
+                // Segment tangent: use segment [i, i+1] if available, else [i-1, i].
+                const int seg_idx_o = std::min(i, N_finer - 2);
+                const Vec3 seg_tangent_finer = [&]() -> Vec3 {
+                    const Vec3 d = finerFrames[seg_idx_o + 1].getCenter()
+                                 - finerFrames[seg_idx_o].getCenter();
+                    const Real dn = d.norm();
+                    return (dn > s_eps) ? d / dn
+                        : finerFrames[seg_idx_o].getOrientation().rotate(Vec3(Real(1), Real(0), Real(0)));
+                }();
+                
+                const auto candidates = candidateSegments(
+                    nodeP, Real(0), r_bp_query, coarserFrames, r_bp_candidate, margin);
+
+                Real bestDist = std::numeric_limits<Real>::max();
+                Real best_s_i = Real(0);
+                Vec3 best_cp_i;
+                int  best_j   = -1;
+                bool foundAny = false;
+
+                for (const int j : candidates)
+                {
+                    const Vec3 q0 = coarserFrames[j].getCenter();
+                    const Vec3 q1 = coarserFrames[j + 1].getCenter();
+
+                    Real s_i = Real(0);
+                    Vec3 cp_i;
+                    nodeToSegment(nodeP, q0, q1, s_i, cp_i);
+
+                    Real centrelineDist = (nodeP - cp_i).norm();
+                    if (centrelineDist < s_eps)
+                    {
+                        if (!isNested)
+                        {
+                            msg_error() << "ALGO_2: external mode, centerlines coincide at "
+                                        "outer-loop node " << i << ", inner segment " << j
+                                        << " — real interpenetration.";
+                        }
+
+                    }
+
+                    const Real gap = computeGap(centrelineDist);
+
+                    if (gap < bestDist)
+                    {
+                        bestDist    = gap;
+                        best_s_i   = s_i;
+                        best_cp_i  = cp_i;
+                        best_j     = j;
+                        foundAny   = true;
+                    }
+                }
+
+                if (!foundAny) continue;
+                const Real bestGap = computeGap(bestDist);
+
+                // Re-label to original beam-1/beam-2 numbering.
+                const int  idx1   = useSwapped ? best_j : i;
+                const int  idx2   = useSwapped ? i      : best_j;
+                const Vec3 pint1  = useSwapped ? best_cp_i : nodeP;
+                const Vec3 pint2  = useSwapped ? nodeP     : best_cp_i;
+                const Real s1_out = useSwapped ? best_s_i  : Real(0);
+                const Real s2_out = useSwapped ? Real(0)   : best_s_i;
+
+                const Vec3 q0_best = coarserFrames[best_j].getCenter();
+                const Vec3 q1_best = coarserFrames[best_j + 1].getCenter();
+                const Vec3 seg_tangent_coarser = [&]() -> Vec3 {
+                    const Vec3 d = q1_best - q0_best;
+                    const Real dn = d.norm();
+                    return (dn > s_eps) ? d / dn
+                        : coarserFrames[best_j].getOrientation().rotate(Vec3(Real(1), Real(0), Real(0)));
+                }();
+
+                const Vec3& t1 = useSwapped ? seg_tangent_coarser : seg_tangent_finer;
+                const Vec3& t2 = useSwapped ? seg_tangent_finer   : seg_tangent_coarser;
+
+                // SLERP frames for the last-resort normal fallback.
+                // Not swapped: contact on Beam-1 is at a node (idx1) — degenerate SLERP, safe.
+                // Swapped:     contact on Beam-1 is interpolated along segment [idx1, idx1+1].
+                const RigidCoord& slerp_fA = frames1.ref()[idx1];
+                const RigidCoord& slerp_fB = useSwapped
+                    ? frames1.ref()[idx1 + 1]
+                    : frames1.ref()[idx1];
+                const Real slerp_s = useSwapped ? s1_out : Real(0);
+
+                // Compute raw contact normal (always Beam-1 → Beam-2).
+                const Vec3 nHat_raw = computeContactNormal(
+                    pint1, pint2, idx1, idx2, t1, t2,
+                    slerp_fA, slerp_fB, slerp_s);
+
+                // enforce outer→inner sign convention for nested mode output.
+                // Same logic as ALGO_1.
+                // Previously: no sign flip.
+                const Vec3 nHat_out = (isNested && !beam1IsOuter) ? -nHat_raw : nHat_raw;
+                m_contactNormals.push_back(nHat_out);
+
+                // Use correct contact-relevant radii for mapToSurface.
+                // Same logic as ALGO_1.
+                // Previously: mapToSurface(pint1, pint2, nHat, r1, r2, psurf1, psurf2);
+                Vec3 psurf1, psurf2;
+                mapToSurface(pint1, pint2, nHat_raw, r_map1, r_map2, psurf1, psurf2);
+
+                // ── Tangential displacements – ALGO_2 ────────────────────────────
+                // ALGO_2 has an asymmetric structure: one side is always  
+                // a node (contact point = frame origin, moment arm = 0, no interp)   
+                // and the other is a segment point (full rigid-body interpolation).   
+                // We branch on useSwapped to identify which beam plays which role.   
+                //                                                                   
+                // NOT swapped: finer = beam1 (node side), coarser = beam2 (segment) 
+                //     Swapped: finer = beam2 (node side), coarser = beam1 (segment)  
+
+                Real delta_t1 = Real(0);
+                Real delta_t2 = Real(0);
+
+				 Vec3 t1_contact, t2_contact;
+            	 computeContactFrame(t1 /*tau1*/, t2 /*tau2*/, nHat_out, t1_contact, t2_contact);
+				 m_contactTangents1.push_back(t1_contact);
+				 m_contactTangents2.push_back(t2_contact);
+
+                
+                auto cross = [](const Vec3& a, const Vec3& b) -> Vec3 {
+                    return Vec3(a[1]*b[2] - a[2]*b[1],
+                                a[2]*b[0] - a[0]*b[2],
+                                a[0]*b[1] - a[1]*b[0]);
+                };
+
+                Vec3 v_Pa, v_Pb;
+
+                if (!useSwapped)
+                {
+                    const Vec3 pf1_i    = frames1.ref()[idx1].getCenter();
+                    const Vec3 r1_i     = psurf1 - pf1_i;          // = r_map1 * nHat_raw
+                    const Vec3 omega1_i = vels1[idx1].getVOrientation();
+                    v_Pa = vels1[idx1].getVCenter() + cross(omega1_i, r1_i);
+                    
+                    const int next2 = std::min(idx2 + 1, (int)vels2.size() - 1);
+                    const Vec3 pf2_j   = frames2.ref()[idx2].getCenter();
+                    const Vec3 pf2_j1  = frames2.ref()[next2].getCenter();
+                    const Vec3 r2_j    = psurf2 - pf2_j;
+                    const Vec3 r2_j1   = psurf2 - pf2_j1;
+                    const Vec3 omega2_j  = vels2[idx2].getVOrientation();
+                    const Vec3 omega2_j1 = vels2[next2].getVOrientation();
+
+                    v_Pb =
+                        (vels2[idx2].getVCenter()  + cross(omega2_j,  r2_j))  * (Real(1) - s2_out)
+                      + (vels2[next2].getVCenter() + cross(omega2_j1, r2_j1)) * s2_out;
+                }
+                else
+                {
+                    const Vec3 pf2_i    = frames2.ref()[idx2].getCenter();
+                    const Vec3 r2_i     = psurf2 - pf2_i;          // = −r_map2 * nHat_raw
+                    const Vec3 omega2_i = vels2[idx2].getVOrientation();
+                    v_Pb = vels2[idx2].getVCenter() + cross(omega2_i, r2_i);
+                    
+                    const int next1 = std::min(idx1 + 1, (int)vels1.size() - 1);
+                    const Vec3 pf1_j   = frames1.ref()[idx1].getCenter();
+                    const Vec3 pf1_j1  = frames1.ref()[next1].getCenter();
+                    const Vec3 r1_j    = psurf1 - pf1_j;
+                    const Vec3 r1_j1   = psurf1 - pf1_j1;
+                    const Vec3 omega1_j  = vels1[idx1].getVOrientation();
+                    const Vec3 omega1_j1 = vels1[next1].getVOrientation();
+                    v_Pa =
+                        (vels1[idx1].getVCenter()  + cross(omega1_j,  r1_j))  * (Real(1) - s1_out)
+                      + (vels1[next1].getVCenter() + cross(omega1_j1, r1_j1)) * s1_out; 
+                }
+
+                const Vec3 v_rel = v_Pb - v_Pa;
+                delta_t1 = (v_rel * t1_contact) * dt_sim;
+                delta_t2 = (v_rel * t2_contact) * dt_sim;
+                
+                
+                outParams.push_back({ s1_out, s2_out });
+                m_distances.push_back(Vec3(bestGap, delta_t1, delta_t2)); 
+                m_centerlinePoints1.push_back(pint1);                     
+                m_centerlinePoints2.push_back(pint2);                      
+                m_surfacePoints1.push_back(psurf1);                         
+                m_surfacePoints2.push_back(psurf2);                        
+                m_contactSectionIds.push_back({ idx1, idx2 });    
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  computeContactNormal
+    //
+    //  Returns the RAW Beam-1 → Beam-2 contact normal.
+    //  The nested outer→inner sign flip is applied by doUpdate() on the output,
+    //  NOT here, so that m_lastValidNormal caches the raw direction and the cache
+    //  remains consistent regardless of which beam is outer/inner in the scene.
+    //
+    //  Zero-normal fallback order:
+    //    1. Last valid normal for pair (i,j) from m_lastValidNormal.
+    //    2. Cross product of segment tangents t̂1 × t̂2.
+    //    3. User-supplied defaultNormal rotated by SLERP frame at contact point.
+    // ─────────────────────────────────────────────────────────────────────────────
+    SphereSweptIntersectionMethod::Vec3
+SphereSweptIntersectionMethod::computeContactNormal(
+    const Vec3&       pint1,
+    const Vec3&       pint2,
+    int               i,
+    int               j,
+    const Vec3&       seg1Tangent,
+    const Vec3&       seg2Tangent,
+    const RigidCoord& frameA,
+    const RigidCoord& frameB,
+    Real              s1)
+{
+    // Current SLERP'd Beam-1 orientation at the contact point — used both          
+    // for caching on the write path and for the smoothness test on the read path.
+    // Previously: computed only in fallback 2c.
+    const auto qSlerpNow = frameA.getOrientation().slerp(frameB.getOrientation(), s1);
+
+    // ── 1. Standard case: non-degenerate centreline separation ───────────────
+    Vec3       n     = pint2 - pint1;
+    const Real dnorm = n.norm();
+
+    if (dnorm >= s_eps)
+    {
+        n /= dnorm;
+        m_lastValidNormal[{i, j}] = {n, qSlerpNow};                                
+        return n;
+    }
+
+    // ── 2. Zero-normal fallback ──────────────────────────────────────────────
+
+    // 2a. Reuse last valid normal for this (i,j) pair, ONLY if it passes         
+    //     two validity tests:
+    //       (a) perpendicularity: |n_cached · t̂₁| and |n_cached · t̂₂| small
+    //       (b) smoothness     : Beam-1 SLERP'd frame rotated by at most
+    //                            d_cachedNormalMaxFrameRotation since cache time.
+    //     If either test fails, we DO NOT use the cached value but we DO NOT
+    //     erase it — it may become usable again in a later timestep.
+    //     Previously: cached normal was returned unconditionally.
+    auto it = m_lastValidNormal.find({i, j});
+    if (it != m_lastValidNormal.end())
+    {
+        const Vec3& n_cached = it->second.normal;
+        const auto& q_cached = it->second.qSlerp;
+
+        // Test (a): perpendicularity to both segment tangents.
+        const Real tolPerp = d_cachedNormalMaxAxialProjection.getValue();
+        const Real proj1   = std::abs(n_cached * seg1Tangent); // Vec3::operator* is dot
+        const Real proj2   = std::abs(n_cached * seg2Tangent);
+        const bool passPerp = (proj1 <= tolPerp) && (proj2 <= tolPerp);
+
+        // Test (b): smoothness of SLERP'd contact-point frame.
+        // Relative quat q_rel = q_now * q_cached^{-1}; angle = 2*acos(|w|).
+        const auto qRel    = qSlerpNow * q_cached.inverse();
+        Real       wAbs    = std::abs(qRel[3]); // scalar component; convention [0..2]=xyz, [3]=w
+        if (wAbs > Real(1)) wAbs = Real(1);     // clamp for acos numerical safety
+        const Real rotAngle  = Real(2) * std::acos(wAbs);
+        const Real tolRot    = d_cachedNormalMaxFrameRotation.getValue();
+        const bool passSmooth = (rotAngle <= tolRot);
+
+        if (passPerp && passSmooth)
+        {
+            msg_warning() << "Contact pair (" << i << "," << j
+                          << "): zero contact normal (coincident centrelines). "
+                             "Reusing last valid normal (validated: |n.t1|=" << proj1
+                          << ", |n.t2|=" << proj2
+                          << ", frame rot=" << rotAngle << " rad).";
+            return n_cached;
+        }
+
+        // Cache not trusted for this step — fall through without erasing.
+        msg_warning() << "Contact pair (" << i << "," << j
+                      << "): zero contact normal, but cached normal rejected "
+                          "(|n.t1|=" << proj1 << ", |n.t2|=" << proj2
+                      << ", frame rot=" << rotAngle << " rad; tolPerp=" << tolPerp
+                      << ", tolRot=" << tolRot
+                      << "). Cache preserved; falling back to tangent cross-product.";
+    }
+
+    // 2b. Cross product of segment tangents (first occurrence, or cache rejected).
+    Vec3 n_cross = Vec3(
+        seg1Tangent[1] * seg2Tangent[2] - seg1Tangent[2] * seg2Tangent[1],
+        seg1Tangent[2] * seg2Tangent[0] - seg1Tangent[0] * seg2Tangent[2],
+        seg1Tangent[0] * seg2Tangent[1] - seg1Tangent[1] * seg2Tangent[0]);
+    const Real nc_norm = n_cross.norm();
+
+    if (nc_norm >= s_eps)
+    {
+        n_cross /= nc_norm;
+        msg_warning() << "Contact pair (" << i << "," << j
+                      << "): zero contact normal (coincident centrelines). "
+                         "Using tangent cross-product fallback.";
+        // Only overwrite cache if it was empty; otherwise the rejected entry    
+        // might still be useful later once geometry relaxes back.
+        // Previously: always overwrote cache.
+        if (it == m_lastValidNormal.end())
+            m_lastValidNormal[{i, j}] = {n_cross, qSlerpNow};
+        return n_cross;
+    }
+
+    // 2c. Superimposed parallel beams: rotate user-supplied defaultNormal
+    //     by the SLERP frame at the contact point.
+    const Vec3 defN = d_defaultNormal.getValue();
+    if (defN.norm() < s_eps)
+    {
+        msg_error() << "Contact pair (" << i << "," << j
+                    << "): superimposed parallel beams and defaultNormal is zero. "
+                       "Using global Y-axis.";
+        return Vec3(Real(0), Real(1), Real(0));
+    }
+    const Vec3 n_local = qSlerpNow.rotate(defN.normalized());                  
+    msg_warning() << "Contact pair (" << i << "," << j
+                  << "): superimposed parallel beams, cached normal unavailable/rejected. "
+                     "Using user-supplied defaultNormal rotated by SLERP frame.";
+
+    if (it == m_lastValidNormal.end())                                             
+        m_lastValidNormal[{i, j}] = {n_local, qSlerpNow};
+    return n_local;
+}
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  getContactNormal – accessor for the k-th output slot normal.
+    // ─────────────────────────────────────────────────────────────────────────────
+    SphereSweptIntersectionMethod::Vec3 SphereSweptIntersectionMethod::getContactNormal(std::size_t k) const
+    {   
+        ensureUpdated(); 
+        if (k >= m_contactNormals.size())
+        {
+            msg_error() << "getContactNormal: index " << k
+                        << " is out of range (current contact count = "
+                        << m_contactNormals.size() << "). Aborting.";
+            return Vec3(Real(0), Real(0), Real(1));
+        }
+        return m_contactNormals[k];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  mapToSurface
+    //  Maps centreline contact points to physical surface contact points using the
+    //  raw Beam-1→Beam-2 normal nHat and caller-supplied contact-relevant radii:
+    //
+    //    psurf1 = pint1 + r_surf1 * nHat
+    //    psurf2 = pint2 − r_surf2 * nHat
+    //
+    //  The caller (doUpdate) selects r_surf1/r_surf2 based on the contact mode:
+    //    External:            r_surf1=r1,   r_surf2=r2
+    //    Nested (beam1=outer):r_surf1=ri1,  r_surf2=r2
+    //    Nested (beam1=inner):r_surf1=r1,   r_surf2=ri2
+    // ─────────────────────────────────────────────────────────────────────────────
+    void SphereSweptIntersectionMethod::mapToSurface(
+        const Vec3& pint1,
+        const Vec3& pint2,
+        const Vec3& nHat,
+        Real  r_surf1, Real r_surf2,
+        Vec3& psurf1,
+        Vec3& psurf2)
+    {
+        psurf1 = pint1 + nHat * r_surf1;
+        psurf2 = pint2 - nHat * r_surf2;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  ALGO_1: Segment-to-Segment (Ericson 2005, §5.1.9)
+    // ─────────────────────────────────────────────────────────────────────────────
+    bool SphereSweptIntersectionMethod::segmentToSegment(
+        const Vec3& p0, const Vec3& p1,
+        const Vec3& q0, const Vec3& q1,
+        Real& s1, Real& s2,
+        Vec3& cp1, Vec3& cp2)
+    {
+        const Vec3 d1 = p1 - p0;
+        const Vec3 d2 = q1 - q0;
+        const Vec3 r  = p0 - q0;
+
+        const Real a = d1.norm2();
+        const Real e = d2.norm2();
+        const Real f = d2 * r;
+
+        if (a <= s_eps && e <= s_eps)
+        {
+            s1 = s2 = Real(0);
+            cp1 = p0; cp2 = q0;
+            return true;
+        }
+
+        if (a <= s_eps)
+        {
+            s1 = Real(0);
+            s2 = std::clamp(f / e, Real(0), Real(1));
+        }
+        else
+        {
+            const Real c = d1 * r;
+            if (e <= s_eps)
+            {
+                s2 = Real(0);
+                s1 = std::clamp(-c / a, Real(0), Real(1));
+            }
+            else
+            {
+                const Real b     = d1 * d2;
+                const Real denom = a * e - b * b;
+
+                if (denom > s_eps)
+                    s1 = std::clamp((b * f - c * e) / denom, Real(0), Real(1));
+                else
+                    s1 = Real(0);  // parallel segments
+
+                s2 = (b * s1 + f) / e;
+
+                if (s2 < Real(0))
+                {
+                    s2 = Real(0);
+                    s1 = std::clamp(-c / a, Real(0), Real(1));
+                }
+                else if (s2 > Real(1))
+                {
+                    s2 = Real(1);
+                    s1 = std::clamp((b - c) / a, Real(0), Real(1));
+                }
+            }
+        }
+
+        cp1 = p0 + d1 * s1;
+        cp2 = q0 + d2 * s2;
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  ALGO_2: Node-to-Segment (exact closed-form projection)
+    //
+    //  For a LINEAR segment Q(s) = q0 + s*(q1−q0):
+    //    s* = clamp( (P−q0)·(q1−q0) / ||q1−q0||² , 0, 1 )
+    // ─────────────────────────────────────────────────────────────────────────────
+    bool SphereSweptIntersectionMethod::nodeToSegment(
+        const Vec3& node,
+        const Vec3& q0, const Vec3& q1,
+        Real& s2, Vec3& cp)
+    {
+        const Vec3 dq  = q1 - q0;
+        const Real dqn = dq.norm2();
+
+        if (dqn < s_eps)
+        {
+            s2 = Real(0);
+            cp = q0;
+            return true;
+        }
+
+        s2 = std::clamp((node - q0) * dq / dqn, Real(0), Real(1));
+        cp = q0 + dq * s2;
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  candidateSegments – broad-phase bounding-sphere overlap test.
+    //
+    // These are abstract broad-phase radii supplied
+    //  by the caller (contact-relevant: bore for outer tube in nested mode,
+    //  outer radius otherwise). The implementation is unchanged.
+    // ─────────────────────────────────────────────────────────────────────────────
+    sofa::type::vector<int> SphereSweptIntersectionMethod::candidateSegments(
+        const Vec3&          queryMid,
+        Real                 queryHalfLength,
+        Real                 r_bp_query,      
+        const VecRigidCoord& candidateFrames,  
+        Real                 r_bp_candidate,  
+        Real                 broadPhaseMarginFactor)
+    {
+        const int N = static_cast<int>(candidateFrames.size());
+        sofa::type::vector<int> candidates;
+        candidates.reserve(std::max(0, N - 1));
+
+        const Real R_i = queryHalfLength + r_bp_query * broadPhaseMarginFactor;
+
+        for (int j = 0; j < N - 1; ++j)
+        {
+            const Vec3 q0    = candidateFrames[j].getCenter();
+            const Vec3 q1    = candidateFrames[j + 1].getCenter();
+            const Vec3 mid_j = (q0 + q1) * Real(0.5);
+            const Real R_j   = (q1 - q0).norm() * Real(0.5)
+                               + r_bp_candidate * broadPhaseMarginFactor;
+
+            if ((queryMid - mid_j).norm() <= R_i + R_j)
+                candidates.push_back(j);
+        }
+        return candidates;
+    }
+
+	// ─────────────────────────────────────────────────────────────────────────
+    //  computeContactFrame
+    //
+    //  Refactors the tangent-frame projection block that was previously
+    //  duplicated inline in ALGO_1.  ALGO_2 had the same computation missing.
+    //
+    //  Algorithm:
+    //    t̂₁ = normalize(τ₁ − (τ₁·n̂)·n̂)   [project onto contact plane]
+    //    t̂₂ = n̂ × t̂₁
+    //
+    //  Fallback chain when τ₁ ∥ n̂:
+    //    → try τ₂ (Beam-2 chord)
+    //    → try global X, then global Y
+    // ─────────────────────────────────────────────────────────────────────────
+    void SphereSweptIntersectionMethod::computeContactFrame(
+        const Vec3& tau1,
+        const Vec3& tau2,
+        const Vec3& nHat,
+        Vec3&       t1_out,
+        Vec3&       t2_out) 
+    {
+        // Project tau1 onto the contact plane (perpendicular to nHat).
+        const Vec3 proj1  = tau1 - nHat * (tau1 * nHat);
+        const Real proj1n = proj1.norm();
+ 
+        if (proj1n > s_eps)
+        {
+            t1_out = proj1 / proj1n;
+        }
+        else
+        {
+            // tau1 ∥ nHat: try tau2.
+            const Vec3 proj2  = tau2 - nHat * (tau2 * nHat);
+            const Real proj2n = proj2.norm();
+            if (proj2n > s_eps)
+            {
+                t1_out = proj2 / proj2n;
+            }
+            else
+            {
+                Vec3 ref     = Vec3(Real(1), Real(0), Real(0));
+                Vec3 ref_proj = ref - nHat * (ref * nHat);
+                if (ref_proj.norm() < s_eps)
+                {
+                    ref      = Vec3(Real(0), Real(1), Real(0));
+                    ref_proj = ref - nHat * (ref * nHat);
+                }
+                const Real rn = ref_proj.norm();
+                t1_out = (rn > s_eps) ? ref_proj / rn : Vec3(Real(1), Real(0), Real(0));
+            }
+        }
+ 
+        // t̂₂ = n̂ × t̂₁  (circumferential, unit by construction when n̂ ⊥ t̂₁)
+        t2_out = Vec3(
+            nHat[1]*t1_out[2] - nHat[2]*t1_out[1],
+            nHat[2]*t1_out[0] - nHat[0]*t1_out[2],
+            nHat[0]*t1_out[1] - nHat[1]*t1_out[0]);
+        const Real t2n = t2_out.norm();
+        if (t2n > s_eps) t2_out /= t2n;
+    }
+ 
+ 
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getContactTangent1(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_contactTangents1.size())
+        {
+            msg_error() << "getContactTangent1(): index " << k
+                        << " out of range (size=" << m_contactTangents1.size()
+                        << "). Returning fallback (1,0,0).";
+            return Vec3(Real(1), Real(0), Real(0));
+        }
+        return m_contactTangents1[k];
+    }
+ 
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getContactTangent2(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_contactTangents2.size())
+        {
+            msg_error() << "getContactTangent2(): index " << k
+                        << " out of range (size=" << m_contactTangents2.size()
+                        << "). Returning fallback (0,1,0).";
+            return Vec3(Real(0), Real(1), Real(0));
+        }
+        return m_contactTangents2[k];
+    }
+
+	bool SphereSweptIntersectionMethod::isAlgo2() const
+	{
+		return d_algorithmType.getValue().getSelectedItem() == "ALGO_2";
+	}
+    
+    SphereSweptIntersectionMethod::Real
+    SphereSweptIntersectionMethod::gapSignForPublishedNormal() const
+    {
+        const bool isNested =
+            (d_contactConfiguration.getValue().getSelectedItem() == "nested");
+        if (!isNested)
+            return Real(1);
+        const bool beam1IsOuter = (d_radius1.getValue() >= d_radius2.getValue());
+        return beam1IsOuter ? Real(-1) : Real(1);
+    }
+    
+    std::size_t SphereSweptIntersectionMethod::getNumContacts() const
+    {
+        ensureUpdated();  
+        return m_contactNormals.size();
+    }
+
+    SphereSweptIntersectionMethod::Vec2d
+SphereSweptIntersectionMethod::getCurvilinearParams(std::size_t k) const
+    {
+        ensureUpdated();  
+        const auto& params = d_curvilinearParams.getValue();
+        if (k >= params.size())
+        {
+            msg_error() << "getCurvilinearParams: index " << k
+                        << " out of range (size=" << params.size() << ").";
+            return Vec2d(Real(0), Real(0));
+        }
+        return params[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getDistances(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_distances.size())
+        {
+            msg_error() << "getDistances: index " << k
+                        << " out of range (size=" << m_distances.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_distances[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getCenterlinePoint1(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_centerlinePoints1.size())
+        {
+            msg_error() << "getCenterlinePoint1: index " << k
+                        << " out of range (size=" << m_centerlinePoints1.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_centerlinePoints1[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getCenterlinePoint2(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_centerlinePoints2.size())
+        {
+            msg_error() << "getCenterlinePoint2: index " << k
+                        << " out of range (size=" << m_centerlinePoints2.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_centerlinePoints2[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getSurfacePoint1(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_surfacePoints1.size())
+        {
+            msg_error() << "getSurfacePoint1: index " << k
+                        << " out of range (size=" << m_surfacePoints1.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_surfacePoints1[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getSurfacePoint2(std::size_t k) const
+    {   
+        ensureUpdated();  
+        if (k >= m_surfacePoints2.size())
+        {
+            msg_error() << "getSurfacePoint2: index " << k
+                        << " out of range (size=" << m_surfacePoints2.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_surfacePoints2[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec2i
+    SphereSweptIntersectionMethod::getContactSectionIds(std::size_t k) const
+    {   
+        ensureUpdated();  
+        if (k >= m_contactSectionIds.size())
+        {
+            msg_error() << "getContactSectionIds: index " << k
+                        << " out of range (size=" << m_contactSectionIds.size() << ").";
+            return Vec2i(-1, -1);
+        }
+        return m_contactSectionIds[k];
+    }
+    
+    void SphereSweptIntersectionMethod::ensureUpdated() const
+    {
+        // updateIfDirty() comes from DDGNode (via DataEngine). It is a no-op
+        // if the node is already clean, otherwise it runs doUpdate().
+        // const_cast is the documented SOFA idiom for this pattern: the logical
+        // state (inputs → outputs) is unchanged, only the cached representation
+        // is refreshed.
+        const_cast<SphereSweptIntersectionMethod*>(this)->updateIfDirty();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  SOFA factory registration
+    // ─────────────────────────────────────────────────────────────────────────────
+    void registerSphereSweptIntersectionMethod(sofa::core::ObjectFactory* factory)
+    {
+        factory->registerObjects(sofa::core::ObjectRegistrationData(
+            "Computes the minimum distance and contact points between two "
+            "Cosserat beams modelled as sphere-swept (canal) surfaces.\n"
+            "Implements Lee 2007: minimum distance between two canal surfaces "
+            "= minimum distance between two moving spheres along their centrelines.\n"
+            "Supports solid beams (external contact) and hollow tubes (CTR nesting).")
+            .add<SphereSweptIntersectionMethod>());
+    }
+
+} // namespace Cosserat
