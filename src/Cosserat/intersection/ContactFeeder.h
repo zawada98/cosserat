@@ -45,6 +45,8 @@ namespace sofa::core { class ObjectFactory; }
 // ── Constraint type we populate ───────────────────────────────────────────────
 #include <sofa/component/constraint/lagrangian/model/UnilateralLagrangianConstraint.h>
 
+#include <Cosserat/engine/ContactTriad.h>
+
 namespace Cosserat
 {
 
@@ -85,15 +87,7 @@ namespace Cosserat
         using Data = sofa::core::objectmodel::Data<T>;
 
         // ── Data inputs (linked from SSIM outputs) ────────────────────────────────
-
-        /// Surface contact points on Beam 1  (Pc_A[k] = centreline + r1·n̂).
-        /// Link to SphereSweptIntersectionMethod::d_surfacePoints1.
-        Data<VecVec3> d_surfacePoints1;
-
-        /// Surface contact points on Beam 2  (Pc_B[k] = centreline − r2·n̂).
-        /// Link to SphereSweptIntersectionMethod::d_surfacePoints2.
-        Data<VecVec3> d_surfacePoints2;
-
+        
         /// Gap vectors {δn, 0, 0} per contact pair — only component [0] is used.
         /// δn = ‖Pint1 − Pint2‖ − (r1+r2).  δn < 0 ⇒ interpenetration.
         /// Link to SphereSweptIntersectionMethod::d_distances.
@@ -110,9 +104,15 @@ namespace Cosserat
         /// 0 = frictionless (1 DOF, UnilateralConstraintResolution).
         /// μ > 0 activates tangential friction (3 DOF, ...WithFriction).
         Data<Real> d_mu;
+        
+        /// Per-pair contact triad (n̂, t̂₁, t̂₂) produced by BCM.
+        /// Read as  triads[k].n ,  triads[k].t1 ,  triads[k].t2 .
+        /// Link to  @BCM.contactTriads .
+        sofa::core::objectmodel::Data<VecContactTriad> d_contactTriads;
 
-        Data<VecVec3> d_centerlinePoints1;
-        Data<VecVec3> d_centerlinePoints2;
+        /// Global gap sign s ∈ {+1, −1} such that (Pc_B − Pc_A)·n̂ = s·δn.
+        /// Link to  @BCM.gapSign .
+        sofa::core::objectmodel::Data<Real> d_gapSign;
 
         // ── Object link ───────────────────────────────────────────────────────────
 

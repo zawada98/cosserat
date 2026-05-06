@@ -20,14 +20,6 @@ namespace Cosserat
 // ─────────────────────────────────────────────────────────────────────────────
 ContactFeeder::ContactFeeder()
     : Inherit1()
-    , d_surfacePoints1(initData(&d_surfacePoints1,
-        "surfacePoints1",
-        "Surface contact points on Beam 1 (Pc_A[k]).\n"
-        "Link to SphereSweptIntersectionMethod::d_surfacePoints1."))
-    , d_surfacePoints2(initData(&d_surfacePoints2,
-        "surfacePoints2",
-        "Surface contact points on Beam 2 (Pc_B[k]).\n"
-        "Link to SphereSweptIntersectionMethod::d_surfacePoints2."))
     , d_distances(initData(&d_distances,
         "distances",
         "Gap vectors {delta_n, 0, 0} per contact pair.\n"
@@ -49,16 +41,14 @@ ContactFeeder::ContactFeeder()
         "Both object1 and object2 of that constraint must be the single\n"
         "interleaved BCM output MechanicalObject (size 2K).\n"
         "DOF 2k = Pc_A[k] (Beam-1 surface), DOF 2k+1 = Pc_B[k] (Beam-2 surface)."))
-    , d_centerlinePoints1(initData(&d_centerlinePoints1,
-    "centerlinePoints1",
-    "Centreline contact points on Beam 1 (Pint_A[k]).\n"
-    "Link to SphereSweptIntersectionMethod::d_centerlinePoints1.\n"
-    "Used to compute the sign-safe contact normal."))
-    , d_centerlinePoints2(initData(&d_centerlinePoints2,
-    "centerlinePoints2",
-    "Centreline contact points on Beam 2 (Pint_B[k]).\n"
-    "Link to SphereSweptIntersectionMethod::d_centerlinePoints2.\n"
-    "Used to compute the sign-safe contact normal."))
+    , d_contactTriads(initData(&d_contactTriads,
+        "contactTriads",
+        "Per-pair contact triad (n̂, t̂₁, t̂₂) read as triads[k].n / .t1 / .t2.\n"
+        "Link to @BCM.contactTriads."))
+    , d_gapSign(initData(&d_gapSign, Real(1),
+        "gapSign",
+        "Global gap sign s ∈ {+1, −1} such that (Pc_B − Pc_A)·n̂ = s·δn.\n"
+        "Link to @BCM.gapSign."))
 {
     // Enable event handling so handleEvent() is called by the simulation loop.
     this->f_listening.setValue(true);
@@ -81,6 +71,7 @@ void ContactFeeder::init()
                       << " is negative. Clamping to 0 (frictionless).";
         d_mu.setValue(Real(0));
     }
+	std::cout << "INITIALIZED SUCCESFFULLY";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -141,54 +132,71 @@ void ContactFeeder::feedContacts()
     auto* cstr = l_constraint.get();
     if (!cstr) return;
 
-    // Reading these Data triggers SSIM::doUpdate() if dirty.
-    const auto& pts1  = d_surfacePoints1.getValue();
-    const auto& pts2  = d_surfacePoints2.getValue();
-    const auto& cl1 = d_centerlinePoints1.getValue();
-    const auto& cl2 = d_centerlinePoints2.getValue();
-    const auto& dists = d_distances.getValue();
+    // Reading these Data triggers SSIM::doUpdate() / BCM::apply() if dirty.
+    const auto& dists  = d_distances.getValue();
 
-    const int K = static_cast<int>(
-    std::min({ pts1.size(), pts2.size(), dists.size(),
-               cl1.size(), cl2.size() }));
+    // modified: read triad and gapSign from BCM instead of reconstructing the
+    // normal from centerlines. The BCM-published normal is the geometric
+    // ground truth for both external and nested contacts; gapSign is the
+    // scalar that converts (Pc_B − Pc_A)·n̂_pub into the signed gap δn.
+    // was: const auto& cl1 = d_centerlinePoints1.getValue();
+    //      const auto& cl2 = d_centerlinePoints2.getValue();
+    //      Vec3 n = cl2[k] - cl1[k];  ...  n = Vec3(0,0,1);
+    const auto& triads = d_contactTriads.getValue();
+    const Real  s_gap  = d_gapSign.getValue();
+    
 
-    // Clear the previous step's contacts and reserve space for up to K entries.
+    const int K = static_cast<int>(triads.size());
+
     cstr->clear(K);
-
     if (K == 0) return;
+
+    // modified: hard guard against an unlinked / wrongly-typed gapSign Data.
+    // BCM must publish ±1 exactly; anything else silently corrupts the
+    // constraint sign convention.
+    if (std::abs(std::abs(s_gap) - Real(1)) > Real(1e-6))
+    {
+        msg_warning() << "gapSign = " << s_gap
+                      << " is not ±1. ContactFeeder is most likely not linked "
+                       "to @BCM.gapSign. Skipping all contacts this step.";
+        return;
+    }
 
     const Real alarm = d_alarmDistance.getValue();
     const Real mu    = d_mu.getValue();
 
-    using Params =
-        sofa::component::constraint::lagrangian::model
-            ::UnilateralLagrangianContactParameters;
+    using Params = sofa::component::constraint::lagrangian::model
+                   ::UnilateralLagrangianContactParameters;
 
     for (int k = 0; k < K; ++k)
     {
         const Real delta_n = dists[k][0];
-        if (delta_n >= alarm) continue; //todo
+        if (delta_n >= alarm) continue;     // separated more than alarm: no constraint
 
-        // Contact normal: unit vector from Pc_A (Beam-1 surface) to Pc_B (Beam-2 surface).
-        // Falls back to skipping this pair if the surface points are coincident
-        // (degenerate case; BeamContactMapping will also have logged a warning).
-        Vec3 n = cl2[k] - cl1[k];
-        const Real d = n.norm();
-        if (d < s_eps) continue;
-        n = Vec3(0, 0, 1);//todo
+        // BCM convention:
+        //   n̂_pub  = (Pc_B − Pc_A)/‖…‖           (always Beam-1 → Beam-2)
+        //   (Pc_B − Pc_A) · n̂_pub  =  s · δn      (s = ±1, supplied by BCM)
+        //
+        // ULC computes  dfree = (xfree[m2] − xfree[m1]) · norm
+        //                     = (Pc_B − Pc_A) · norm
+        // Choosing norm = s · n̂_pub  ⇒  dfree = s² · δn = δn
+        //   external (s=+1): norm = +n̂_pub
+        //   nested   (s=−1): norm = −n̂_pub
+        // In both cases dfree < 0 ⟺ penetration ⟹ λ ≥ 0 is enforced.
 
-        // addContact(params, norm, contactDistance, m1, m2)
-        //
-        // MODIFIED: BCM now uses a single interleaved output MO (size 2K).
-        //   m1 = 2k   → singleMO[2k]   = Pc_A[k]  (Beam-1 surface, object1 side)
-        //   m2 = 2k+1 → singleMO[2k+1] = Pc_B[k]  (Beam-2 surface, object2 side)
-        //
-        // Previously: m1 = k, m2 = k   (with two separate MOs of size K each).
+        const Vec3& n_pub = triads[k].n;
+        const Real  n_len = n_pub.norm();
+        if (n_len < s_eps) continue;       // degenerate triad — skip silently
+
+        // modified: norm = s · n̂_pub. No local recomputation, no hardcoded axis.
+        // was: n = cl2[k] - cl1[k]; n.normalize(); n = Vec3(0,0,1);
+        const Vec3 norm = s_gap * n_pub;
+
         Params params(mu);
-        cstr->addContact(params, n,
-            /*contactDistance=*/Real(0.0),
-                         2*k,
-                         2*k+1);
+        cstr->addContact(params, norm,
+                         /*contactDistance=*/Real(0.0),
+                         /*m1=*/2*k,
+                         /*m2=*/2*k + 1);
     }
 }
 
