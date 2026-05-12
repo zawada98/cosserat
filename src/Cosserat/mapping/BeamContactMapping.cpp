@@ -30,7 +30,8 @@
  // that was already __declspec(dllimport) in the same TU causes a
  // dllexport/dllimport conflict on MSVC.
 #include <sofa/core/Multi2Mapping.inl>
-
+#include <fstream>
+#include <cstdlib>
 namespace sofa::core
 {
     template class Multi2Mapping<
@@ -175,7 +176,7 @@ namespace Cosserat
     //  the active K have no mechanical effect.
     // ─────────────────────────────────────────────────────────────────────────
     void BeamContactMapping::apply(
-        const sofa::core::MechanicalParams* /*mparams*/,
+        const sofa::core::MechanicalParams* mparams,
         const sofa::type::vector<sofa::core::objectmodel::Data<OutVecCoord>*>&
         dataVecOutPos,
         const sofa::type::vector<const sofa::core::objectmodel::Data<In1VecCoord>*>&
@@ -183,6 +184,14 @@ namespace Cosserat
         const sofa::type::vector<const sofa::core::objectmodel::Data<In2VecCoord>*>&
         dataVecIn2Pos)
     {
+        static std::ofstream bcmlog("bcm_apply_log.txt", std::ios::out | std::ios::trunc);
+        bcmlog << "[BCM.apply] t=" << this->getContext()->getTime()
+               << " outPtr="  << static_cast<const void*>(dataVecOutPos[0])
+               << " in1Ptr="  << static_cast<const void*>(dataVecIn1Pos[0])
+               << " in2Ptr="  << static_cast<const void*>(dataVecIn2Pos[0])
+               << "\n";
+        bcmlog.flush();
+        
         if (!l_ssim.get())
         {
             msg_error() << "apply(): l_ssim is null — cannot fetch SSIM outputs. "
@@ -265,89 +274,107 @@ namespace Cosserat
         struct ContactGeom { Vec3 Pc_A, Pc_B, n; };
 
         auto computeGeom = [&](int k) -> std::pair<bool, ContactGeom>
-            {
-                const Vec2i sec = l_ssim->getContactSectionIds(k); 
-                const int  i     = sec[0];
-                const int  j     = sec[1];
-                const Vec2d cp    = params[k];   
-                const Real alpha = cp[0];
-                const Real beta  = cp[1];
+        {
+            const Vec2i sec = l_ssim->getContactSectionIds(k);
+            const int   i   = sec[0];
+            const int   j   = sec[1];
+            const Vec2d cp  = params[k];
+            const Real  alpha = cp[0];
+            const Real  beta  = cp[1];
 
-                const bool b1Valid = beam1IsNode ? (i >= 0 && i     < N1)
-                                         : (i >= 0 && i + 1 < N1);
-                const bool b2Valid = beam2IsNode ? (j >= 0 && j     < N2)
+            const bool b1Valid = beam1IsNode ? (i >= 0 && i     < N1)
+                                             : (i >= 0 && i + 1 < N1);
+            const bool b2Valid = beam2IsNode ? (j >= 0 && j     < N2)
                                              : (j >= 0 && j + 1 < N2);
 
-                if (!b1Valid || !b2Valid)
-                {
-                    msg_error() << "Contact pair " << k << ": index out of range "
-                        << "(i=" << i << " j=" << j
-                        << " N1=" << N1 << " N2=" << N2 << "). Skipping.";
-                    m_jacCache[k].nBeam1Blocks = 0;
-                    m_jacCache[k].nBeam2Blocks = 0;
-                    return { false, {} };
-                }
+            if (!b1Valid || !b2Valid)
+            {
+                msg_error() << "Contact pair " << k << ": index out of range "
+                    << "(i=" << i << " j=" << j
+                    << " N1=" << N1 << " N2=" << N2 << "). Skipping.";
+                m_jacCache[k].nBeam1Blocks = 0;
+                m_jacCache[k].nBeam2Blocks = 0;
+                return { false, {} };
+            }
 
-                // ── Surface contact points from SSIM ────────────────────────
-                // Pc_A and Pc_B are fully computed by SSIM (correct radii,
-                // external vs. nested CTR mode).  No recomputation here.
-                const Vec3 Pc_A = l_ssim->getSurfacePoint1(k);
-                const Vec3 Pc_B = l_ssim->getSurfacePoint2(k);
+            // ── Contact identity from SSIM (frozen at step start) ───────────────
+            // n̂, t̂₁, t̂₂ remain SSIM-frozen by design (Fix A contract).
+            const Vec3 n  = l_ssim->getContactNormal(k);
+            const Vec3 t1 = l_ssim->getContactTangent1(k);
+            const Vec3 t2 = l_ssim->getContactTangent2(k);
 
-                // ── Contact normal from SSIM ────────────────────────────────
-                // getContactNormal() returns the cached value from doUpdate().
-                // SSIM owns the full zero-normal fallback chain.
-                const Vec3 n = l_ssim->getContactNormal(k);
+            // ── Centreline points: SSIM snapshot vs. current input frames ──────
+            const Vec3 P_A_ssim  = l_ssim->getCenterlinePoint1(k);
+            const Vec3 P_B_ssim  = l_ssim->getCenterlinePoint2(k);
+            const Vec3 Pc_A_ssim = l_ssim->getSurfacePoint1(k);
+            const Vec3 Pc_B_ssim = l_ssim->getSurfacePoint2(k);
 
-                // ── Contact-frame tangents from SSIM ───────────────────────
-                // Previously: BCM computed t̂₁/t̂₂ by projecting the Beam-1 chord onto
-                // the contact plane — exactly what SSIM already does in doUpdate().
-                // Now: read directly from the pre-fetched arrays.  Zero recomputation.
-                const Vec3 t1 =l_ssim->getContactTangent1(k);
-                const Vec3 t2 = l_ssim->getContactTangent2(k);
 
-                // ── Moment arms ───────────────────────────────────────────────
-                // arm = contact_surface_point − frame_centre
-                // These are the only quantities BCM computes that SSIM does not export,
-                // because they depend on the input-MO frame centres passed to apply().
-                const Vec3 p_i   = frames1[i].getCenter();
-                const Vec3 p_j   = frames2[j].getCenter();
+            Vec3 P_A_in, P_B_in;
+            if (beam1IsNode) {
+                P_A_in = frames1[i].getCenter();
+            } else {
+                P_A_in = frames1[i    ].getCenter() * (Real(1) - alpha)
+                       + frames1[i + 1].getCenter() *  alpha;
+            }
+            if (beam2IsNode) {
+                P_B_in = frames2[j].getCenter();
+            } else {
+                P_B_in = frames2[j    ].getCenter() * (Real(1) - beta)
+                       + frames2[j + 1].getCenter() *  beta;
+            }
 
-                ContactJacEntry& entry = m_jacCache[k];
+            // ── Surface points re-based on current input frames ────────────────
+            // (Pc_ssim − P_ssim) is r_eff · n̂ along the frozen normal — invariant
+            // under the kinematic difference between the SSIM snapshot and the
+            // current input. So Pc_A/Pc_B follow the input frames without BCM
+            // needing to know r_eff or contactConfiguration.
+            // was: const Vec3 Pc_A = l_ssim->getSurfacePoint1(k);
+            // was: const Vec3 Pc_B = l_ssim->getSurfacePoint2(k);
+            const Vec3 Pc_A = P_A_in + (Pc_A_ssim - P_A_ssim);   
+            const Vec3 Pc_B = P_B_in + (Pc_B_ssim - P_B_ssim);  
 
-                if (beam1IsNode)
-                {
-                    entry.nBeam1Blocks = 1;
-                    entry.beam1Blocks[0] = { i, Real(1), Pc_A - p_i };
-                }
-                else
-                {
-                    const Vec3 p_ip1 = frames1[i + 1].getCenter();
-                    entry.nBeam1Blocks = 2;
-                    entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - p_i   };
-                    entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - p_ip1 };
-                }
-            
-                if (beam2IsNode)
-                {
-                    entry.nBeam2Blocks = 1;
-                    entry.beam2Blocks[0] = { j, Real(1), Pc_B - p_j };
-                }
-                else
-                {
-                    const Vec3 p_jp1 = frames2[j + 1].getCenter();
-                    entry.nBeam2Blocks = 2;
-                    entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - p_j   };
-                    entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - p_jp1 };
-                }
+            // ── Moment arms (unchanged code; now naturally consistent) ─────────
+            // arm = Pc − p_frame. Both terms come from the SAME input frames pass,
+            // so the arm is the moment arm in the current input configuration —
+            // exactly what applyJ/applyJT(MatrixDeriv) need to be J-consistent.
+            const Vec3 p_i = frames1[i].getCenter();
+            const Vec3 p_j = frames2[j].getCenter();
 
-                // Store contact frame for applyJ / applyJT.
-                entry.normal   = n;
-                entry.tangent1 = t1;  
-                entry.tangent2 = t2; 
+            ContactJacEntry& entry = m_jacCache[k];
 
-                return { true, { Pc_A, Pc_B, n } };
-            };
+            if (beam1IsNode)
+            {
+                entry.nBeam1Blocks = 1;
+                entry.beam1Blocks[0] = { i, Real(1), Pc_A - p_i };
+            }
+            else
+            {
+                const Vec3 p_ip1 = frames1[i + 1].getCenter();
+                entry.nBeam1Blocks = 2;
+                entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - p_i   };
+                entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - p_ip1 };
+            }
+
+            if (beam2IsNode)
+            {
+                entry.nBeam2Blocks = 1;
+                entry.beam2Blocks[0] = { j, Real(1), Pc_B - p_j };
+            }
+            else
+            {
+                const Vec3 p_jp1 = frames2[j + 1].getCenter();
+                entry.nBeam2Blocks = 2;
+                entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - p_j   };
+                entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - p_jp1 };
+            }
+
+            entry.normal   = n;
+            entry.tangent1 = t1;
+            entry.tangent2 = t2;
+
+            return { true, { Pc_A, Pc_B, n } };
+        };
 
         // ── Write output positions (monotonic resize only — never shrink) ─────
         const sofa::Size newK = static_cast<sofa::Size>(K);
@@ -442,7 +469,7 @@ namespace Cosserat
         {
             triads[k] = ContactTriad{};                                  // n = t1 = t2 = 0
             dists[k]  = Vec3(kInvalidGap, Real(0), Real(0));             // δn = +∞ → cleared
-        }        
+        }
     }
 
 

@@ -393,6 +393,44 @@ namespace Cosserat
 
     protected:
         // ── Internal geometry helpers ─────────────────────────────────────────────
+    	
+    	/**                                                                          
+		 * @brief Nested-mode segment-pair contact metric.                           
+		 *                                                                           
+		 * For a candidate T2 segment [q0,q1] against an outer-loop T1 segment       
+		 * [p0,p1], finds the parameter range on T1 that T2 actually shadows         
+		 * axially, and returns the point of MAXIMUM radial separation over that     
+		 * sub-range. Replaces standard min-centreline-distance selection for        
+		 * nested geometry, where worst penetration corresponds to LARGEST radial    
+		 * offset (gap = ri_outer − r_outer_inner − dist).                           
+		 *                                                                           
+		 * Theory:                                                                   
+		 *   At each s_1 ∈ [s_start, s_end] on T1, define the corresponding T2      
+		 *   point Q(s_1) by enforcing (Q − P(s_1)) ⊥ d1. Then                       
+		 *     s_2(s_1) = (s_1·|d1|² − (Q0−P0)·d1) / (d2·d1)                         
+		 *   Q − P stays in the plane perpendicular to d1 and is linear in s_1,      
+		 *   so r²(s_1) is convex quadratic → max is at an endpoint of the overlap.  
+		 *                                                                           
+		 * Axial-overlap filter: T2 segments whose s_1 projection lies entirely      
+		 * outside [0,1] are physically in free space relative to this T1 segment    
+		 * and are rejected (return false). Without this filter, the nested gap      
+		 * formula produces spurious large penetrations from arc tips that hang      
+		 * outside the bore axially.                                                 
+		 *                                                                           
+		 * @param p0,p1     Endpoints of outer-loop (T1) segment.                    
+		 * @param q0,q1     Endpoints of candidate (T2) segment.                     
+		 * @param s1_out    [out] Parameter on T1 at max-radial location ∈ [0,1].   
+		 * @param s2_out    [out] Parameter on T2 at corresponding point ∈ [0,1].   
+		 * @param cp1,cp2   [out] Contact points on T1 and T2 (P, Q).                
+		 * @param radial    [out] ‖cp2 − cp1‖ at the max-radial location.            
+		 * @return          true if axial overlap is non-empty; false → skip pair.   
+		 */                                                                          
+		static bool axialOverlapMaxRadial(                                           
+		    const Vec3& p0, const Vec3& p1,                                          
+		    const Vec3& q0, const Vec3& q1,                                          
+		    Real& s1_out, Real& s2_out,                                              
+		    Vec3& cp1, Vec3& cp2,                                                    
+		    Real& radial);  
 
         /**
          * @brief ALGO_1 – Segment-to-Segment minimum distance (Ericson 2005 §5.1.9).

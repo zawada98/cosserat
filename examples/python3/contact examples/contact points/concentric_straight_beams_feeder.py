@@ -58,8 +58,8 @@ SCENE_DIR = os.path.dirname(os.path.abspath(__file__))
 #  Scene parameters
 # ──────────────────────────────────────────────────────────────────────────────
 BEAM_LENGTH      = 120.0    # [mm]  total length of each beam
-NB_SECTIONS      = 5        # number of Cosserat sections per beam
-NB_FRAMES        = 10       # number of output Rigid3d frames per beam
+NB_SECTIONS      = 6        # number of Cosserat sections per beam
+NB_FRAMES        = 20       # number of output Rigid3d frames per beam
 RADIUS1_EX       = 6.0      # [mm]  cross-section radius
 RADIUS1_IN       = 5.0      # [mm]  cross-section radius
 RADIUS2_EX       = 2.0      # [mm]  cross-section radius
@@ -68,35 +68,10 @@ YOUNG_MODULUS    = 3.0e6    # [Pa]
 POISSON_RATIO    = 0.49
 STIFFNESS        = 1.0e8    # base-clamp stiffness  (Beam 2 clamped end)
 ALGORITHM        = "ALGO_1" # "ALGO_1" (segment-seg) or "ALGO_2" (node-seg NR)
-DT               = 1e-4   # [s]   time step
+DT               = 1e-3   # [s]   time step
 MAX_STEPS        = 500      # stop automatically after this many steps
 MAX_K = NB_FRAMES
-ALARM_DISTANCE = 3.0 * RADIUS2_EX
-
-class JiggleRecorder(Sofa.Core.Controller):
-    def __init__(self, t2_frames_mo, out_path, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mo = t2_frames_mo
-        self.out_path = out_path
-        self.rows = []
-
-    def onAnimateEndEvent(self, event):
-        t = self.getContext().time.value
-        tip = list(self.mo.position.value[-1])[:3]  # last frame center
-        mid = list(self.mo.position.value[len(self.mo.position.value)//2])[:3]
-        self.rows.append((t, *tip, *mid))
-
-    def onSimulationInitDoneEvent(self, event):
-        pass
-
-    def __del__(self):
-        try:
-            with open(self.out_path, 'w') as f:
-                f.write("t,tip_x,tip_y,tip_z,mid_x,mid_y,mid_z\n")
-                for r in self.rows:
-                    f.write(",".join(str(v) for v in r) + "\n")
-        except Exception:
-            pass
+ALARM_DISTANCE = 0.5 * RADIUS2_EX
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Geometry
@@ -554,7 +529,7 @@ def createScene(root_node: Sofa.Core.Node):
       Beam 1 along their shared length.
     """
 
-    root_node.gravity = [0., 0., -9810.]   # mm/s² gravity
+    #root_node.gravity = [0., 0., -9810.]   # mm/s² gravity
     root_node.dt      = DT
 
     root_node.addObject('RequiredPlugin', pluginName=[
@@ -710,9 +685,7 @@ def createScene(root_node: Sofa.Core.Node):
     contactMO = contact_output.addObject(
         'MechanicalObject', template='Vec3d',
         name='contactMO_gap',
-        position=[[0., 0., 0.]] * 2*MAX_K,
-    rest_position = [[0., 0., 0.]] * 2 * MAX_K)
-
+        position=[[0., 0., 0.]] * 2*MAX_K)
 
     bcm = contact_output.addObject(
         'BeamContactMapping',
@@ -725,12 +698,23 @@ def createScene(root_node: Sofa.Core.Node):
     )
 
     contact_output.addObject(
-        'ContactPointsUnilateralConstraint',
-        name='cpuc',
-        mu = 0,
-        contactTriads = bcm.getLinkPath() + '.contactTriads',
-        gapSign = bcm.getLinkPath() + '.gapSign',
-        )
+        'UnilateralLagrangianConstraint',
+        template='Vec3d',
+        name='ulc',
+        object1=contactMO.getLinkPath(),
+        object2=contactMO.getLinkPath(),
+    )
+
+    feeder = contact_output.addObject(
+        'ContactFeeder',
+        name='feeder',
+        distances=bcm.getLinkPath() + '.distances',
+        constraint='@ulc',
+        alarmDistance=ALARM_DISTANCE,
+        mu=0,
+        contactTriads=bcm.getLinkPath() + '.contactTriads',
+        gapSign=bcm.getLinkPath() + '.gapSign',
+    )
 
     t2_curv_abs_frames = list(
         beam2_framesNode.cosseratMapping.curv_abs_output.value
@@ -744,11 +728,5 @@ def createScene(root_node: Sofa.Core.Node):
         t2_frame_curv_abs=t2_curv_abs_frames,
         bridge=gui_bridge,
         every_n_steps=20,
-    ))
-
-    intersection_node.addObject(JiggleRecorder(
-        name='JiggleRec',
-        t2_frames_mo=beam2_framesNode.FramesMO,
-        out_path=os.path.join(SCENE_DIR, 'jiggle.csv'),
     ))
     return root_node

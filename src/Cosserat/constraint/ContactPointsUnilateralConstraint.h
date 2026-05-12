@@ -116,6 +116,10 @@ public:
     void draw(const sofa::core::visual::VisualParams* vparams) override;
 
     bool isActive() const override;
+    
+    void storeLambda(const sofa::core::ConstraintParams* cParams,
+                 sofa::core::MultiVecDerivId res,
+                 const sofa::linearalgebra::BaseVector* lambda) override;
 
     sofa::type::vector<std::string> getConstraintIdentifiers() override
     {

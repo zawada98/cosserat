@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ctr_curved_in_straight.py
+garbage.py
 =========================
 SOFA / Cosserat Plugin -- nested CTR with a STRAIGHT outer beam and a
 PRE-CURVED inner arc.  Heavily based on simulate_ctr_two_tubes.py; only

@@ -151,8 +151,8 @@ T1_PARAMS = {
     'E':             6e10,
     'v':             0.33,
     'density':       6450,
-    'nb_sections':   50,
-    'nb_frames':     100,
+    'nb_sections':   20,
+    'nb_frames':     20,
     'color':         [0.75, 0.20, 0.75, 0.35],
 }
 
@@ -167,8 +167,8 @@ T2_PARAMS = {
     'E':             6e10,
     'v':             0.33,
     'density':       6450,
-    'nb_sections':   50,
-    'nb_frames':     100,
+    'nb_sections':   20,
+    'nb_frames':     20,
     'color':         [0.15, 0.50, 1.00, 1.0],
 }
 
@@ -265,8 +265,8 @@ def compute_concentric_offset(p_outer, p_inner):
     return -X   # negative: inner base sits behind the outer base
 
 def compute_tube_geometry(p, x_offset=0.0,
-                         init_strategy='natural',   # MODIFIED  was: (no such kwarg)
-                         outer_params=None):        # MODIFIED  was: (no such kwarg)
+                         init_strategy='natural',
+                         outer_params=None):
     """
     Build Cosserat discretization for a pre-curved tube.
 
@@ -333,8 +333,6 @@ def compute_tube_geometry(p, x_offset=0.0,
     section_lengths = [ls] * n_str + [lc] * n_crv
     rest_states     = [[0., 0., 0.]] * n_str + [[0., 0., kappa]] * n_crv
 
-    # MODIFIED  init_states is now built per the chosen strategy.
-    # was: init_states = [[0., 0., 0.]] * ns
     if init_strategy == 'straight':
         init_states = [[0., 0., 0.]] * ns
 
@@ -403,12 +401,6 @@ def compute_tube_geometry(p, x_offset=0.0,
     lf           = L / nf
     frm_curv_abs = [round(i * lf, 10) for i in range(nf + 1)]
 
-    # MODIFIED  Seed FramesMO with the curved configuration produced by
-    # init_states (see integrate_frame_positions for the integration scheme).
-    # When init_states is all zeros this reduces to the previous straight-
-    # line placeholder, so 'straight' mode is unaffected.
-    # was: frame_positions = [[x_offset + s, 0., 0., 0., 0., 0., 1.]
-    #                         for s in frm_curv_abs]
     frame_positions = integrate_frame_positions(
         section_lengths, init_states, frm_curv_abs, x_offset
     )
@@ -769,7 +761,7 @@ def add_tube_visual(frame_node, p, color=None, n_circle=N_CIRCLE):
 # =============================================================================
 
 def add_cosserat_tube(root_node, p, x_offset=0.0,
-                     init_strategy='natural',     # MODIFIED  was: (no such kwarg)
+                     init_strategy='natural',
                      outer_params=None):
     """
     Build the full Cosserat beam hierarchy for one pre-curved tube.

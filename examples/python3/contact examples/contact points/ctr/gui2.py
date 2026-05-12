@@ -3,7 +3,7 @@
 gui_5dof.py
 ===========
 Tkinter-based GUI bridge for the curved-in-straight CTR scene
-(ctr_curved_in_straight.py).
+(garbage.py).
 
 Differs from gui.py
 -------------------

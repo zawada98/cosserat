@@ -5,6 +5,9 @@
  *                                                                            *
  * See ContactPointsUnilateralConstraint.h for full documentation.           *
  ******************************************************************************/
+#include <fstream>
+#include <cstdlib>
+
 #include "ContactPointsUnilateralConstraint.h"
 
 #include <sofa/core/ObjectFactory.h>
@@ -20,7 +23,15 @@ namespace Cosserat
 
 using sofa::component::constraint::lagrangian::model::UnilateralConstraintResolution;
 using sofa::component::constraint::lagrangian::model::UnilateralConstraintResolutionWithFriction;
-
+    
+    std::ofstream& cpucLog() {
+        static std::ofstream f = [] {
+            const char* dir = std::getenv("COSSERAT_LOG_DIR");
+            std::string path = (dir ? std::string(dir) + "/" : std::string("")) + "cpuc_log.txt";
+            return std::ofstream(path, std::ios::out | std::ios::trunc);
+        }();
+        return f;
+    }
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constructor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,9 +226,11 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
     if (!m_constraintRowsBuilt) return;    
     if (m_contacts.empty()) return;
 
-    const VecCoord& xfree = xfree_d.getValue();
+    //const VecCoord& xfree = xfree_d.getValue();
     const VecCoord& x     = this->mstate->read(
                                 sofa::core::vec_id::read_access::position)->getValue();
+    const VecCoord& xfree     = this->mstate->read(
+                                sofa::core::vec_id::read_access::freePosition)->getValue();
 
     const bool posOrder =
         (cParams->constOrder() == sofa::core::ConstraintOrder::POS ||
@@ -227,25 +240,44 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
 
     if (posOrder)
     {
+        const VecDeriv& vfree =
+        this->mstate->read(sofa::core::vec_id::read_access::freeVelocity)->getValue();
+        const SReal dt = this->getContext()->getDt();
         for (Contact& con : m_contacts)
         {
             const int m1 = 2 * con.k;
             const int m2 = 2 * con.k + 1;
 
-            const Coord& Pfree = xfree[m2];
-            const Coord& Qfree = xfree[m1];
-            const Coord& P     = x    [m2];
-            const Coord& Q     = x    [m1];
+            const Coord& Pfree = x[m2] + vfree[m2] * dt;
+            const Coord& Qfree = x[m1] + vfree[m1] * dt;
+            const Coord& P     = x[m2];
+            const Coord& Q     = x[m1];
 
             const Coord PPfree = Pfree - P;
             const Coord QQfree = Qfree - Q;
             const Real  ref_dist = PPfree.norm() + QQfree.norm();
 
-            const Real dfree = m_sign * sofa::type::dot(Pfree - Qfree, con.n);
+            const Real dfree_pred = m_sign * sofa::type::dot(Pfree - Qfree, con.n);
             const Real delta = m_sign * sofa::type::dot(P     - Q    , con.n);
+            const Real dfree = std::min(delta, dfree_pred);
+            
+            //std::cout << "delta from violation calculation" <<delta << std::endl;
+            //std::cout << "delta_free from violation calculation" <<dfree << std::endl;
 
             v->set(con.cId, dfree);
             con.dfree_n = dfree;
+            auto& log = cpucLog();
+            log << "[CPUC-RAW] t=" << this->getContext()->getTime()
+                << " k="     << con.k
+                << " P=("    << P[0]     << "," << P[1]     << "," << P[2]     << ")"
+                << " Pfree=("<< Pfree[0] << "," << Pfree[1] << "," << Pfree[2] << ")"
+                << " Q=("    << Q[0]     << "," << Q[1]     << "," << Q[2]     << ")"
+                << " Qfree=("<< Qfree[0] << "," << Qfree[1] << "," << Qfree[2] << ")"
+                << " delta=" << delta
+                << " dfree=" << dfree
+                << " n=("    << con.n[0] << "," << con.n[1] << "," << con.n[2] << ")"
+                << "\n";
+            log.flush();
 
             if (!withFriction) continue;
 
@@ -433,7 +465,39 @@ void ContactPointsUnilateralConstraint::draw(
 
     vparams->drawTool()->drawLines(verts, 3, cols);
 }
+    
+    void ContactPointsUnilateralConstraint::storeLambda(
+        const sofa::core::ConstraintParams* cParams,
+        sofa::core::MultiVecDerivId res,
+        const sofa::linearalgebra::BaseVector* lambda)
+{
+    // Let the base class do the actual J^T·λ back-propagation first.
+    Inherit::storeLambda(cParams, res, lambda);
 
+    if (!lambda || m_contacts.empty()) return;
+
+    const bool fric = d_mu.getValue() > Real(0);
+    const SReal t   = this->getContext()->getTime();
+
+    auto& log = cpucLog();
+    for (const Contact& con : m_contacts)
+    {
+        const SReal lam_n  = lambda->element(con.cId);
+        const SReal lam_t1 = fric ? lambda->element(con.cId + 1) : 0.0;
+        const SReal lam_t2 = fric ? lambda->element(con.cId + 2) : 0.0;
+
+        log << "[CPUC] t=" << t
+            << " k="      << con.k
+            << " cId="    << con.cId
+            << " dfree="  << con.dfree_n
+            << " ln="     << lam_n
+            << " lt1="    << lam_t1
+            << " lt2="    << lam_t2
+            << " n=("     << con.n[0] << "," << con.n[1] << "," << con.n[2] << ")"
+            << "\n";
+    }
+    log.flush();
+}
 // ─────────────────────────────────────────────────────────────────────────────
 //  Factory registration
 // ─────────────────────────────────────────────────────────────────────────────

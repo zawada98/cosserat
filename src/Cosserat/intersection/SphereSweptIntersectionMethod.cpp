@@ -5,6 +5,9 @@
  *                                                                            *
  * See SphereSweptIntersectionMethod.h for full documentation.               *
  ******************************************************************************/
+#include <fstream>
+#include <cstdlib>
+
 #include "SphereSweptIntersectionMethod.h"
 
 #include <sofa/core/ObjectFactory.h>
@@ -273,6 +276,17 @@ bool SphereSweptIntersectionMethod::validateParameters()
     // ─────────────────────────────────────────────────────────────────────────────
     //  doUpdate  – main entry point
     // ─────────────────────────────────────────────────────────────────────────────
+    std::ofstream& ssimLog() {
+        // Opens once. Path is overridable via the COSSERAT_LOG_DIR env var,
+        // otherwise drops next to wherever runSofa was launched from.
+        static std::ofstream f = [] {
+            const char* dir = std::getenv("COSSERAT_LOG_DIR");
+            std::string path = (dir ? std::string(dir) + "/" : std::string("")) + "ssim_log.txt";
+            return std::ofstream(path, std::ios::out | std::ios::trunc);
+        }();
+        return f;
+    }
+    
     void SphereSweptIntersectionMethod::doUpdate()
     {   
         // ── Write-accessors for outputs ──────────────────────────────────────────
@@ -408,69 +422,89 @@ bool SphereSweptIntersectionMethod::validateParameters()
                 const Vec3 p0 = finerFrames[i].getCenter();
                 const Vec3 p1 = finerFrames[i + 1].getCenter();
 
-                // Segment tangent: world-space direction of the finer-beam segment i.
-                // Fallback: local X-axis from the frame quaternion (Cosserat convention).
                 const Vec3 seg_tangent_finer = [&]() -> Vec3 {
                     const Vec3 d = p1 - p0;
                     const Real dn = d.norm();
                     return (dn > s_eps) ? d / dn
                         : finerFrames[i].getOrientation().rotate(Vec3(Real(1), Real(0), Real(0)));
-                }();
+            }();
 
-                const Vec3 mid_i     = (p0 + p1) * Real(0.5);
-                const Real halfLen_i = (p1 - p0).norm() * Real(0.5);
+            const Vec3 mid_i     = (p0 + p1) * Real(0.5);
+            const Real halfLen_i = (p1 - p0).norm() * Real(0.5);
 
-                // pass contact-relevant broad-phase radii instead of raw outer radii.
-                const auto candidates = candidateSegments(
-                    mid_i, halfLen_i, r_bp_query, coarserFrames, r_bp_candidate, margin);
+            const auto candidates = candidateSegments(
+                mid_i, halfLen_i, r_bp_query, coarserFrames, r_bp_candidate, margin);
 
-                Real bestDist = std::numeric_limits<Real>::max();
-                Real best_s_o = Real(0), best_s_i = Real(0);
-                Vec3 best_cp_o, best_cp_i;
-                int  best_j   = -1;
-                bool foundAny = false;
+            // Best-candidate selection differs by contact configuration:                  
+            //   external: smallest centreline distance wins (Ericson §5.1.9).             
+            //   nested  : axial-overlap filter + LARGEST radial separation over the      
+            //             overlap wins. Candidates with no axial overlap on this T1      
+            //             segment are rejected — they are in axial free space relative   
+            //             to this T1 segment and would produce spurious gap values.       
+            Real bestDist = isNested                                                       // modified
+                            ? std::numeric_limits<Real>::lowest()                         
+                            : std::numeric_limits<Real>::max();                            // was: Real bestDist = std::numeric_limits<Real>::max();
+            Real best_s_o = Real(0), best_s_i = Real(0);
+            Vec3 best_cp_o, best_cp_i;
+            int  best_j   = -1;
+            bool foundAny = false;
 
-                for (const int j : candidates)
-                {
-                    const Vec3 q0 = coarserFrames[j].getCenter();
-                    const Vec3 q1 = coarserFrames[j + 1].getCenter();
+            for (const int j : candidates)
+            {
+                const Vec3 q0 = coarserFrames[j].getCenter();
+                const Vec3 q1 = coarserFrames[j + 1].getCenter();
 
-                    Real s_o = Real(0), s_i = Real(0);
-                    Vec3 cp_o, cp_i;
+                Real s_o = Real(0), s_i = Real(0);
+                Vec3 cp_o, cp_i;
 
+                if (!isNested)                                                             
+                {                                                                         
+                    // ── External: standard segment-to-segment min distance ────────────
                     segmentToSegment(p0, p1, q0, q1, s_o, s_i, cp_o, cp_i);
 
                     Real centrelineDist = (cp_o - cp_i).norm();
                     if (centrelineDist < s_eps)
                     {
-                        if (!isNested)
-                        {
-                            msg_error() << "ALGO_1: external mode, centerlines coincide at segment pair ("
-                                        << (useSwapped ? j : i) << ","
-                                        << (useSwapped ? i : j)
-                                        << "). This is a real interpenetration.";
-                        }
-                        // use midpoint of the finer segment and project it
-                        // onto the coarser segment.
-                        cp_o = (p0 + p1) * Real(0.5);          // midpoint of finer segment
-                        nodeToSegment(cp_o, q0, q1, s_i, cp_i); // projection onto coarser
+                        msg_error() << "ALGO_1: external mode, centerlines coincide at segment pair ("  
+                                    << (useSwapped ? j : i) << ","                                       // (msg_error path is now only reachable in external mode;
+                                    << (useSwapped ? i : j)                                              //  the original `if (!isNested)` guard around the message
+                                    << "). This is a real interpenetration.";                           //  is therefore redundant and removed.)
+                        cp_o = (p0 + p1) * Real(0.5);
+                        nodeToSegment(cp_o, q0, q1, s_i, cp_i);
                         s_o  = Real(0.5);
-                        centrelineDist = (cp_o - cp_i).norm();  // may now be > 0
+                        centrelineDist = (cp_o - cp_i).norm();
                     }
-                    
 
                     if (centrelineDist < bestDist)
                     {
-                        bestDist    = centrelineDist;
-                        best_s_o   = s_o;
-                        best_s_i   = s_i;
-                        best_cp_o  = cp_o;
-                        best_cp_i  = cp_i;
-                        best_j     = j;
-                        foundAny   = true;
+                        bestDist  = centrelineDist;
+                        best_s_o  = s_o; best_s_i = s_i;
+                        best_cp_o = cp_o; best_cp_i = cp_i;
+                        best_j    = j;
+                        foundAny  = true;
                     }
-                }
-
+            }                                                                          
+            else                                                                      
+            {                                                                          
+                // ── Nested: axial-overlap filter + max-radial-in-overlap ──────────  
+                Real radialDist;                                                       
+                if (!axialOverlapMaxRadial(p0, p1, q0, q1,                            
+                                           s_o, s_i, cp_o, cp_i, radialDist))          
+                {                                                                      
+                    continue;  // T2 seg j axially outside this T1 segment.            
+                }                                                                      
+                                                                                      
+                if (radialDist > bestDist)                                           
+                {                                                                   
+                    bestDist  = radialDist;                                            
+                    best_s_o  = s_o; best_s_i = s_i;                                
+                    best_cp_o = cp_o; best_cp_i = cp_i;                            
+                    best_j    = j;                                                   
+                    foundAny  = true;                                                
+                }                                                                     
+            }                                                                         
+        }
+                
                 if (!foundAny) continue;
                 const Real bestGap = computeGap(bestDist);
 
@@ -774,6 +808,24 @@ bool SphereSweptIntersectionMethod::validateParameters()
                 m_contactSectionIds.push_back({ idx1, idx2 });    
             }
         }
+        auto& log = ssimLog();
+        const SReal t = this->getContext()->getTime();
+        for (std::size_t k = 0; k < m_distances.size(); ++k)
+        {
+            const auto& d   = m_distances[k];
+            const auto& sec = m_contactSectionIds[k];
+            const auto& cp  = d_curvilinearParams.getValue()[k];
+            const auto& n   = m_contactNormals[k];
+            log << "[SSIM] t=" << t
+                << " k="    << k
+                << " i="    << sec[0] << " j=" << sec[1]
+                << " a="    << cp[0]  << " b=" << cp[1]
+                << " dn="   << d[0]
+                << " dt1="  << d[1]   << " dt2=" << d[2]
+                << " n=("   << n[0] << "," << n[1] << "," << n[2] << ")"
+                << "\n";
+        }
+        log.flush();   // flush every step so the file survives a crash mid-run
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -1137,7 +1189,96 @@ SphereSweptIntersectionMethod::computeContactNormal(
         const Real t2n = t2_out.norm();
         if (t2n > s_eps) t2_out /= t2n;
     }
- 
+    
+    // ─────────────────────────────────────────────────────────────────────────  
+    //  axialOverlapMaxRadial — nested-mode segment-pair contact metric.          
+    //  See header for theory.                                                    
+    // ─────────────────────────────────────────────────────────────────────────  
+    bool SphereSweptIntersectionMethod::axialOverlapMaxRadial(                    
+        const Vec3& p0, const Vec3& p1,                                           
+        const Vec3& q0, const Vec3& q1,                                           
+        Real& s1_out, Real& s2_out,                                               
+        Vec3& cp1, Vec3& cp2,                                                     
+        Real& radial)                                                             
+    {                                                                             
+        const Vec3 d1   = p1 - p0;                                                
+        const Real d1n2 = d1.norm2();                                             
+        if (d1n2 < s_eps) return false;  // Degenerate T1 segment.                
+                                                                                  
+        const Vec3 d2          = q1 - q0;                                         
+        const Real d2_dot_d1   = d2 * d1;                                         
+        const Vec3 q0_minus_p0 = q0 - p0;                                         
+        const Real q0_dot_d1   = q0_minus_p0 * d1;                                
+                                                                                  
+        // s_1 parameter on T1 where q0 / q1 project axially.                     
+        const Real s1_at_q0 = q0_dot_d1 / d1n2;                                   
+        const Real s1_at_q1 = (q0_dot_d1 + d2_dot_d1) / d1n2;                     
+                                                                                  
+        // Axial overlap clamped to T1's parametric range [0,1].                  
+        const Real s1_lo    = std::min(s1_at_q0, s1_at_q1);                       
+        const Real s1_hi    = std::max(s1_at_q0, s1_at_q1);                       
+        const Real s1_start = std::max(s1_lo, Real(0));                           
+        const Real s1_end   = std::min(s1_hi, Real(1));                           
+                                                                                  
+        if (s1_start > s1_end) return false;  // No axial overlap.                
+                                                                                  
+        // Degeneracy: T2 perpendicular to T1 axis → s_2(s_1) undefined.          
+        // Use T2 midpoint as a conservative single-point representative.         
+        const Real d1n         = std::sqrt(d1n2);                                 
+        const Real d2n         = d2.norm();                                       
+        const bool d2_perp_d1  = (std::abs(d2_dot_d1) < s_eps * d1n * d2n);       
+                                                                                  
+        auto evalAtS1 = [&](Real s1, Real& s2, Vec3& P, Vec3& Q)                  
+        {                                                                         
+            P = p0 + d1 * s1;                                                     
+            if (d2_perp_d1)                                                       
+            {                                                                     
+                s2 = Real(0.5);                                                   
+                Q  = (q0 + q1) * Real(0.5);                                       
+            }                                                                     
+            else                                                                  
+            {                                                                     
+                s2 = (s1 * d1n2 - q0_dot_d1) / d2_dot_d1;                         
+                s2 = std::clamp(s2, Real(0), Real(1));                            
+                Q  = q0 + d2 * s2;                                                
+            }                                                                     
+        };                                                                        
+                                                                                  
+        // r²(s_1) convex quadratic on the overlap → max at one of the endpoints. 
+        Real s2a, s2b;                                                            
+        Vec3 Pa, Pb, Qa, Qb;                                                      
+        evalAtS1(s1_start, s2a, Pa, Qa);                                          
+        evalAtS1(s1_end,   s2b, Pb, Qb);                                          
+                                                                                  
+        const Real r_a = (Qa - Pa).norm();                                        
+        const Real r_b = (Qb - Pb).norm();                                        
+        
+        const Real tol = std::max(Real(1e-12), Real(1e-9) * std::max(r_a, r_b));
+        if (std::abs(r_a - r_b) < tol)
+        {
+            // Tie — collapse to the overlap midpoint to avoid step-to-step flipping.
+            const Real s1_mid = Real(0.5) * (s1_start + s1_end);
+            Real s2_mid; Vec3 Pm, Qm;
+            evalAtS1(s1_mid, s2_mid, Pm, Qm);
+            s1_out = s1_mid; s2_out = s2_mid;
+            cp1 = Pm; cp2 = Qm;
+            radial = (Qm - Pm).norm();
+        }
+        else if (r_a >= r_b)                                                           
+        {                                                                         
+            s1_out = s1_start; s2_out = s2a;                                      
+            cp1 = Pa; cp2 = Qa;                                                   
+            radial = r_a;                                                         
+        }                                                                         
+        else                                                                      
+        {                                                                         
+            s1_out = s1_end; s2_out = s2b;                                        
+            cp1 = Pb; cp2 = Qb;                                                   
+            radial = r_b;                                                         
+        }                                                                         
+        return true;                                                              
+    }                                                                                                                                      
+     
  
 
     SphereSweptIntersectionMethod::Vec3
