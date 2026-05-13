@@ -8,13 +8,7 @@
  * Rigid3d frames produced by DiscreteCosseratMapping.                        *
  *                                                                            *
  * Theory: Lee et al., "Minimum distance between two sphere-swept surfaces",  *
- *         Computer-Aided Design, 2007.                                       *
- *                                                                            *
- * Two algorithms are provided:                                               *
- *   ALGO_1 – Segment-to-Segment (Ericson 2005, §5.1.9)                      *
- *   ALGO_2 – Node-to-Segment    (closed-form projection, exact for linear    *
- *                                 centrelines)                               *
- *                                                                            *
+ *         Computer-Aided Design, 2007.                                       *                                                                       *
  ******************************************************************************/
 #pragma once
 
@@ -51,10 +45,6 @@ namespace Cosserat
 	*                                                    + '.velocity'
 	*   radius1,  radius2                            Outer cross-section radii (>0)
 	*   innerRadius1, innerRadius2                   Bore radii. 0 = solid beam.
-	*   algorithmType                                "ALGO_1" (segment-to-segment,
-	*                                                 Ericson §5.1.9)
-	*                                                "ALGO_2" (node-to-segment,
-	*                                                 closed-form projection)
 	*   contactConfiguration                         "external" | "nested"
 	*   defaultNormal                                Last-resort normal for
 	*                                                coincident + parallel beams.
@@ -73,9 +63,7 @@ namespace Cosserat
 	* Only one quantity is exposed as a SOFA Data field:
 	*   curvilinearParams                            vector<Vec2d> of {s1*, s2*},
 	*                                                one pair per contact, in
-	*                                                ORIGINAL beam numbering. In
-	*                                                ALGO_2, the node-side parameter
-	*                                                is 0.
+	*                                                ORIGINAL beam numbering. 
 	*
 	* Everything else is accessible only through C++ getters (typed for one
 	* contact index k ∈ [0, getNumContacts())):
@@ -141,12 +129,6 @@ namespace Cosserat
 	*   Nested CTR beams are coaxial by construction, so the fallback is the
 	*   hot path there; defaultNormal is mandatory.
 	*
-	* ─── Algorithm selection ────────────────────────────────────────────────
-	*   ALGO_1 loops segment-to-segment over the finer-mesh beam × the coarser
-	*   beam's broad-phase candidates (Ericson §5.1.9 closed form).
-	*   ALGO_2 loops node-to-segment; the finer beam contributes nodes, the
-	*   coarser beam contributes segments. Outputs are re-labelled to original
-	*   beam numbering in both cases.
 	*
 	* ─── Python scene usage ─────────────────────────────────────────────────
 	*   node.addObject('SphereSweptIntersectionMethod',
@@ -161,7 +143,6 @@ namespace Cosserat
 	*       innerRadius2           = 0.0,      # solid inner tube
 	*       contactConfiguration   = 'nested',
 	*       defaultNormal          = '0 1 0',  # REQUIRED for nested
-	*       algorithmType          = 'ALGO_1',
     *       broadPhaseMarginFactor = 1.5)
     */	
 		
@@ -210,11 +191,6 @@ namespace Cosserat
         /// >0 = hollow tube; Beam 2 is the CTR outer tube if radius2 > radius1.
         sofa::Data<Real>          d_innerRadius2;
 
-        /// Contact detection algorithm.
-        /// "ALGO_1" = segment-to-segment (Lee 2007 / Ericson 2005).
-        /// "ALGO_2" = node-to-segment (exact closed-form projection).
-        sofa::Data<sofa::helper::OptionsGroup> d_algorithmType;
-
         /// Contact geometry configuration.
         ///   "external" – beams are always side-by-side.
         ///                Gap = dist − (r1 + r2).
@@ -236,7 +212,7 @@ namespace Cosserat
 
         /// Normalised curvilinear parameters {s1*, s2*} per contact pair.
         /// Always refers to the original beam numbering regardless of which beam
-        /// drove the outer loop. ALGO_2: the node-side beam parameter is 0.
+        /// drove the outer loop. 
         sofa::Data<sofa::type::vector<sofa::type::Vec2d>> d_curvilinearParams;
 
         /// Default contact normal used when centrelines are coincident AND no previous
@@ -254,13 +230,6 @@ namespace Cosserat
         /// exceeds this value. Default 0.17 ≈ sin(10°).
         sofa::Data<Real> d_cachedNormalMaxAxialProjection;       
         
-        /// Tolerance on the angular change of the SLERP'd frame at the contact point 
-        /// between cache time and now, in radians. A cached normal is rejected if the
-        /// frame has rotated by more than this amount since it was cached.
-        /// Default π/18 ≈ 10°.
-        /// Previously: no test; cached normal was always reused.
-        sofa::Data<Real> d_cachedNormalMaxFrameRotation;    
-        
         // ── Constructor / SOFA lifecycle ─────────────────────────────────────────
         SphereSweptIntersectionMethod();
         ~SphereSweptIntersectionMethod() override = default;
@@ -276,7 +245,7 @@ namespace Cosserat
         std::size_t getNumContacts() const;      
 
 		/// {s1*, s2*} curvilinear parameters for contact pair k.
-        /// Always in original beam numbering. ALGO_2: node-side parameter is 0.
+        /// Always in original beam numbering.
         Vec2d getCurvilinearParams(std::size_t k) const; 
 
 		/// {δn, δt1, δt2} signed gap vector in contact-local frame {n̂, t̂₁, t̂₂}.
@@ -357,8 +326,6 @@ namespace Cosserat
                                   const RigidCoord& frameA,
                                   const RigidCoord& frameB,
                                   Real              s1);
-        
-        bool isAlgo2() const;
 
 		/**
          * @brief Force the internal m_* arrays to reflect the current inputs.
@@ -432,9 +399,7 @@ namespace Cosserat
 		    Vec3& cp1, Vec3& cp2,                                                    
 		    Real& radial);  
 
-        /**
-         * @brief ALGO_1 – Segment-to-Segment minimum distance (Ericson 2005 §5.1.9).
-         *
+        /**         *
          * @param p0,p1   endpoints of segment 1
          * @param q0,q1   endpoints of segment 2
          * @param s1      [out] parameter on segment 1
@@ -447,23 +412,23 @@ namespace Cosserat
                                      const Vec3& q0, const Vec3& q1,
                                      Real& s1, Real& s2,
                                      Vec3& cp1, Vec3& cp2);
+    	
+    	/**
+		*
+		* For a LINEAR segment Q(s) = q0 + s*(q1−q0), the minimiser of
+		* ||P − Q(s)||² is given in closed form by:
+		*   s* = clamp( (P−q0)·(q1−q0) / ||q1−q0||² , 0, 1 )
+		*
+		* @param node   point on Beam 1
+		* @param q0,q1  endpoints of the candidate Beam-2 segment
+		* @param s2     [out] minimising parameter ∈ [0,1]
+		* @param cp     [out] closest point on the segment
+		* @return true always
+		*/
+    	static bool nodeToSegment(const Vec3& node,
+								  const Vec3& q0, const Vec3& q1,
+								  Real& s2, Vec3& cp);
 
-        /**
-         * @brief ALGO_2 – exact closed-form node-to-segment projection.
-         *
-         * For a LINEAR segment Q(s) = q0 + s*(q1−q0), the minimiser of
-         * ||P − Q(s)||² is given in closed form by:
-         *   s* = clamp( (P−q0)·(q1−q0) / ||q1−q0||² , 0, 1 )
-         *
-         * @param node   point on Beam 1
-         * @param q0,q1  endpoints of the candidate Beam-2 segment
-         * @param s2     [out] minimising parameter ∈ [0,1]
-         * @param cp     [out] closest point on the segment
-         * @return true always
-         */
-        static bool nodeToSegment(const Vec3& node,
-                                  const Vec3& q0, const Vec3& q1,
-                                  Real& s2, Vec3& cp);
 
         /**
          * @brief Maps centreline contact points to physical surface contact points.
@@ -495,9 +460,9 @@ namespace Cosserat
                                  Vec3& psurf1, Vec3& psurf2);
 
         /**
-         * @brief Broad-phase candidate selection (unified for ALGO_1 and ALGO_2).
+         * @brief Broad-phase candidate selection 
          *
-         * Tests whether the bounding sphere of the query segment (or point for ALGO_2)
+         * Tests whether the bounding sphere of the query segment 
          * overlaps the bounding sphere of each candidate segment j.
          *
          *   R_i = queryHalfLength + factor × r_bp_query
@@ -509,10 +474,9 @@ namespace Cosserat
          *   Nested (finer=outer): r_bp_query = ri_finer (bore), r_bp_candidate = r_outer_coarser
          *   Nested (finer=inner): r_bp_query = r_outer_finer,   r_bp_candidate = ri_coarser (bore)
          *
-         * For ALGO_2 (node query), pass queryHalfLength = 0.
          *
-         * @param queryMid              midpoint of segment i (ALGO_1) or node position (ALGO_2)
-         * @param queryHalfLength       half-length of segment i; 0 for ALGO_2
+         * @param queryMid              midpoint of segment i 
+         * @param queryHalfLength       half-length of segment i;
          * @param r_bp_query            contact-relevant bounding radius of the query beam
          * @param candidateFrames       Rigid3d frames of the candidate beam
          * @param r_bp_candidate        contact-relevant bounding radius of the candidate beam
