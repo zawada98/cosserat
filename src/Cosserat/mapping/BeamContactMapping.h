@@ -88,24 +88,10 @@ namespace Cosserat
      *     applyJ  gives δ̇ = Vec3(s.Ṗ_rel·n̂, Ṗ_rel·t̂₁, Ṗ_rel·t̂₂).
      *     applyJT back-projects: d = n̂·d[0] + t̂₁·d[1] + t̂₂·d[2] before J^T.
      *
-     * ALGO_1 (segment-to-segment, isAlgo2 = false):
      *   sectionIds[k] = {i,j}  →  segment i on Beam-1, segment j on Beam-2
      *   Beam-1 interpolation: frames[i]*(1−α) + frames[i+1]*α
      *   Beam-2 interpolation: frames[j]*(1−β) + frames[j+1]*β
-     *
-     * ALGO_2 (node-to-segment, isAlgo2 = true):
-     *   SSIM guarantees that across all K contact pairs, either s1[k]≡0 for all k
-     *   (Beam-1 is the node side) or s2[k]≡0 for all k (Beam-2 is the node side).
-     *   BCM detects this once per apply() by scanning curvilinearParams:
-     *     if ∃ k : s1[k] > 0  →  Beam-2 is node, Beam-1 is segment
-     *     if ∃ k : s2[k] > 0  →  Beam-1 is node, Beam-2 is segment
-     *     else (all zero)     →  degenerate; default to Beam-1 is node
-     *   We scan (rather than check a single pair) because a contact landing
-     *   exactly on a segment endpoint gives s=0 on the SEGMENT side too, which
-     *   is not a global swap signal.
-     *
-     *   Node-side k:     frame[i] alone, weight = 1
-     *   Segment-side k:  frames[j]*(1−γ) + frames[j+1]*γ, γ ∈ [0,1] from SSIM
+     
      */
     class SOFA_COSSERAT_API BeamContactMapping
         : public sofa::core::Multi2Mapping<
@@ -274,16 +260,11 @@ namespace Cosserat
         };
 
         /// Jacobian cache for one contact pair k.
-        /// ALGO_1: nBeam1Blocks = 2 (frames i and i+1).
-        /// ALGO_2: nBeam1Blocks = 1 (frame i only; weight of i+1 vanishes).
-        /// nBeam2Blocks = 2 for both algorithms.
         struct ContactJacEntry
         {
             sofa::type::fixed_array<JacBlock, 2> beam1Blocks;
-            int nBeam1Blocks{ 0 };
 
             sofa::type::fixed_array<JacBlock, 2> beam2Blocks;
-            int nBeam2Blocks{ 0 };
 
             // contact normal fetched from SSIM and frozen at apply() time.
             // Used by applyJ and applyJT to project gap velocities / forces onto n.
@@ -293,7 +274,6 @@ namespace Cosserat
             /// Contact-plane axial tangent t̂₁ (projected Beam-1 segment chord ⊥ n̂). 
             /// Identical to the t1_contact basis vector used by SSIM for d_distances[1].
             /// Formula: normalize(τ₁ − (τ₁·n̂)·n̂),  τ₁ = unit chord of Beam-1 segment [i, i+1].
-            /// For ALGO_2: τ₁ from adjacent segment or frame local-X fallback.
             Vec3 tangent1{ Vec3(Real(1), Real(0), Real(0)) };
  
             /// Contact-plane circumferential tangent t̂₂ = n̂ × t̂₁.             

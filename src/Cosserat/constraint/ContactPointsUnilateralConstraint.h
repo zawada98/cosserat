@@ -86,7 +86,19 @@ public:
     ///   0  → frictionless → 1 constraint row per pair.
     ///   >0 → friction     → 3 constraint rows per pair.
     sofa::core::objectmodel::Data<Real> d_mu;
-
+    
+    /// Activation tolerance for contact filtering, in metres.
+    /// A contact pair is registered as a constraint row only if its
+    /// current normal gap δ ≤ d_activationTolerance. Pairs with δ
+    /// larger than this (clear separation) are skipped entirely — no
+    /// constraint row is built and no Jacobian contribution is sent
+    /// upstream through BCM. Pairs with δ ≤ tolerance (close to
+    /// touching or already penetrating) are registered normally.
+    /// Mimics the alarm-distance pattern from SOFA's classic
+    /// collision pipeline. Default: 1e-3 (1 mm). Should be ≥ the
+    /// maximum single-step free-motion displacement of either body.
+    sofa::core::objectmodel::Data<Real> d_activationTolerance;
+    
     // ── SOFA lifecycle ───────────────────────────────────────────────────────
     ContactPointsUnilateralConstraint();
     ~ContactPointsUnilateralConstraint() override = default;
@@ -130,6 +142,8 @@ private:
     struct Contact
     {
         int          k;       ///< pair index in SSIM/BCM outputs
+        Coord        P;       ///< Pc_B snapshot taken at buildConstraintMatrix time
+        Coord        Q;       ///< Pc_A snapshot taken at buildConstraintMatrix time
         Vec3         n;       ///< n̂[k]   
         Vec3         t1;       ///< t̂₁[k]   (valid only when μ > 0)
         Vec3         t2;       ///< t̂₂[k]   (valid only when μ > 0)

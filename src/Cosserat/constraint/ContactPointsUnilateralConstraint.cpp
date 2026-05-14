@@ -49,6 +49,12 @@ ContactPointsUnilateralConstraint::ContactPointsUnilateralConstraint()
         "mu",
         "Coulomb friction coefficient μ.  0 → frictionless (1 row per pair);\n"
         "> 0 → friction (3 rows per pair, n̂ + t̂₁ + t̂₂)."))
+    , d_activationTolerance(initData(&d_activationTolerance, Real(1e-3),
+        "activationTolerance",
+        "Maximum positive gap [m] at which a contact pair enters the\n"
+        "constraint set. Pairs with δ > tolerance are skipped (no row,\n"
+        "no Jacobian). Pairs with δ ≤ tolerance are registered. Default\n"
+        "1e-3 (1 mm). Should exceed max free-motion displacement per step."))
 {
 }
 
@@ -117,23 +123,13 @@ void ContactPointsUnilateralConstraint::rebuildContacts()
         m_sign = (m_sign >= Real(0)) ? Real(+1) : Real(-1);
     }
 
-    // was `if (moSize != 2 * K) { msg_error(); return; }`.
-    // Strict equality is brittle: it fires whenever BCM's triad vector and
-    // its output MO get out of sync by any amount, even when every pair k we
-    // care about still has valid slots 2k and 2k+1.  The real per-pair
-    // invariant is checked inside the loop below.
+
     const size_t moSize = this->mstate->getSize();                       
     const bool withFriction = d_mu.getValue() > Real(0);
     m_contacts.reserve(K);
 
     for (size_t k = 0; k < K; ++k)
     {
-        //per-pair index guard.  Each pair needs the two
-        // interleaved slots 2k (Pc_A) and 2k+1 (Pc_B) to exist in contactMO.
-        // BCM resizes contactMO monotonically, so a miss here means BCM did
-        // not run this step, or CPULC is wired to the wrong MO.  Subsequent
-        // pairs have strictly larger indices and would all fail the same
-        // way, so `break` is sufficient and avoids error spam.
         if (2 * k + 1 >= moSize)                                        
         {                                                                 
             msg_error() << "Contact pair " << k                           
@@ -158,6 +154,15 @@ void ContactPointsUnilateralConstraint::rebuildContacts()
         c.n       = triad.n;
         c.cId     = 0;
         c.dfree_n = Real(0);
+        
+        const VecCoord& xMO = this->mstate->read(
+        sofa::core::vec_id::read_access::position)->getValue();
+        c.Q = xMO[2 * k];        // Pc_A — Beam-1 surface
+        c.P = xMO[2 * k + 1];    // Pc_B — Beam-2 surface
+        
+        const Real delta_k = m_sign * sofa::type::dot(c.P - c.Q, c.n);
+        if (delta_k > d_activationTolerance.getValue())
+            continue;
 
         if (withFriction)
         {
@@ -225,10 +230,7 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
     if (!cParams) return;                 
     if (!m_constraintRowsBuilt) return;    
     if (m_contacts.empty()) return;
-
-    //const VecCoord& xfree = xfree_d.getValue();
-    const VecCoord& x     = this->mstate->read(
-                                sofa::core::vec_id::read_access::position)->getValue();
+        
     const VecCoord& xfree     = this->mstate->read(
                                 sofa::core::vec_id::read_access::freePosition)->getValue();
 
@@ -247,22 +249,19 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
         {
             const int m1 = 2 * con.k;
             const int m2 = 2 * con.k + 1;
-
-            const Coord& Pfree = x[m2] + vfree[m2] * dt;
-            const Coord& Qfree = x[m1] + vfree[m1] * dt;
-            const Coord& P     = x[m2];
-            const Coord& Q     = x[m1];
+            
+            const Coord& Pfree = xfree[m2];
+            const Coord& Qfree = xfree[m1];
+            const Coord& P     = con.P;
+            const Coord& Q     = con.Q;
 
             const Coord PPfree = Pfree - P;
             const Coord QQfree = Qfree - Q;
             const Real  ref_dist = PPfree.norm() + QQfree.norm();
-
-            const Real dfree_pred = m_sign * sofa::type::dot(Pfree - Qfree, con.n);
-            const Real delta = m_sign * sofa::type::dot(P     - Q    , con.n);
-            const Real dfree = std::min(delta, dfree_pred);
             
-            //std::cout << "delta from violation calculation" <<delta << std::endl;
-            //std::cout << "delta_free from violation calculation" <<dfree << std::endl;
+            const Real dfree_pred = m_sign * sofa::type::dot(Pfree - Qfree, con.n);
+            const Real delta      = m_sign * sofa::type::dot(P     - Q    , con.n);
+            Real dfree = std::min(dfree_pred, delta);
 
             v->set(con.cId, dfree);
             con.dfree_n = dfree;
@@ -274,6 +273,7 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
                 << " Q=("    << Q[0]     << "," << Q[1]     << "," << Q[2]     << ")"
                 << " Qfree=("<< Qfree[0] << "," << Qfree[1] << "," << Qfree[2] << ")"
                 << " delta=" << delta
+                << " dfree_pred=" << dfree_pred
                 << " dfree=" << dfree
                 << " n=("    << con.n[0] << "," << con.n[1] << "," << con.n[2] << ")"
                 << "\n";
@@ -347,7 +347,7 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
             const int m1 = 2 * con.k;
             const int m2 = 2 * con.k + 1;
 
-            const Deriv QP_invDt = (x[m2] - x[m1]) * invDt;
+            const Deriv QP_invDt = (con.P - con.Q) * invDt;
             const Deriv QP_vfree = vfree[m2] - vfree[m1];
             const Deriv dVec     = QP_vfree + QP_invDt;
 

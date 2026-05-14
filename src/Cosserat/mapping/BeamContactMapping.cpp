@@ -7,13 +7,10 @@
  ******************************************************************************/
 #include "BeamContactMapping.h"
 #include "Cosserat/intersection/SphereSweptIntersectionMethod.h"  
+#include <sofa/core/MechanicalParams.h>
 
 #include <sofa/core/ObjectFactory.h>
-#include <sofa/core/MechanicalParams.h>
-#include <sofa/core/ConstraintParams.h>
 #include <sofa/helper/accessor.h>
-#include <sofa/type/Mat.h>
-#include <algorithm>    // std::min
 
  // ── Explicit template instantiation ──────────────────────────────────────────
  // Multi2Mapping<TIn1,TIn2,TOut> is a class template whose method bodies live
@@ -31,7 +28,6 @@
  // dllexport/dllimport conflict on MSVC.
 #include <sofa/core/Multi2Mapping.inl>
 #include <fstream>
-#include <cstdlib>
 namespace sofa::core
 {
     template class Multi2Mapping<
@@ -149,8 +145,7 @@ namespace Cosserat
     //  ── Contact-local frame (gap mode) ───────────────────────────────────────  
     //
     //  Identical to SSIM d_distances convention:
-    //    τ₁  = unit chord of Beam-1 segment [i, i+1]  (ALGO_1)
-    //           or local-X of frame[i]               (ALGO_2, node has no segment)
+    //    τ₁  = unit chord of Beam-1 segment [i, i+1]
     //    t̂₁ = normalize(τ₁ − (τ₁·n̂)·n̂)             (projected onto contact plane)
     //    t̂₂ = n̂ × t̂₁                                (circumferential)
     //
@@ -186,6 +181,7 @@ namespace Cosserat
     {
         static std::ofstream bcmlog("bcm_apply_log.txt", std::ios::out | std::ios::trunc);
         bcmlog << "[BCM.apply] t=" << this->getContext()->getTime()
+                << " xId=" << (mparams ? mparams->x().getName() : "null")
                << " outPtr="  << static_cast<const void*>(dataVecOutPos[0])
                << " in1Ptr="  << static_cast<const void*>(dataVecIn1Pos[0])
                << " in2Ptr="  << static_cast<const void*>(dataVecIn2Pos[0])
@@ -207,12 +203,11 @@ namespace Cosserat
         sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<In2VecCoord>>
             frames2 = *dataVecIn2Pos[0];
         
-        const bool  algo2  = l_ssim->isAlgo2();
-        const int   K      =  static_cast<int>(l_ssim->getNumContacts()); 
+        const sofa::Size K      =  static_cast<int>(l_ssim->getNumContacts()); 
 
         
-        if (static_cast<int>(m_jacCache.size()) != K)
-            m_jacCache.resize(static_cast<sofa::Size>(K));
+        if (m_jacCache.size() != K)
+            m_jacCache.resize(K);
 
         const int N1 = static_cast<int>(frames1.size());
         const int N2 = static_cast<int>(frames2.size());
@@ -220,47 +215,6 @@ namespace Cosserat
         
         constexpr Real kInvalidGap = Real(1e9);
         
-        bool beam1IsNode = false;
-        bool beam2IsNode = false;
-        
-        if (algo2 && K > 0)
-        {
-            bool anyS1Positive = false;
-            bool anyS2Positive = false;
-            for (int k = 0; k < K; ++k)
-            {
-                const Vec2d cp = params[k];
-                if (cp[0] > s_eps) anyS1Positive = true;
-                if (cp[1] > s_eps) anyS2Positive = true;
-                if (anyS1Positive && anyS2Positive) break;  // inconsistent, reported below
-            }
-
-            if (anyS1Positive && !anyS2Positive)
-            {
-                // Beam-1 has a segment parameter → Beam-2 is the node side.
-                beam2IsNode = true;
-            }
-            else if (!anyS1Positive && anyS2Positive)
-            {
-                beam1IsNode = true;
-            }
-            else if (!anyS1Positive && !anyS2Positive)
-            {
-                // Every pair sits exactly on a segment endpoint on both sides.
-                // Both interpretations give numerically identical Jacobians
-                // (the other block has weight 0). Default to Beam-1 is node.
-                beam1IsNode = true;
-            }
-            else
-            {
-                // anyS1Positive && anyS2Positive: violates SSIM's ALGO_2 contract.
-                msg_error() << "apply(): ALGO_2 reports both s1>0 and s2>0 across "
-                               "contact pairs. SSIM should produce s==0 on exactly "
-                               "one side (the node side). Check SSIM::doUpdate(). "
-                               "Defaulting to Beam-1 is node.";
-                beam1IsNode = true;
-            }
-        }
 
         // ── Per-contact geometry ──────────────────────────────────────────────
         //
@@ -273,29 +227,32 @@ namespace Cosserat
         // NOTHING is recomputed that SSIM already provides.
         struct ContactGeom { Vec3 Pc_A, Pc_B, n; };
 
-        auto computeGeom = [&](int k) -> std::pair<bool, ContactGeom>
+        auto computeGeom = [&](sofa::Size k) -> std::pair<bool, ContactGeom>
         {
+            l_ssim->doUpdate();
             const Vec2i sec = l_ssim->getContactSectionIds(k);
             const int   i   = sec[0];
             const int   j   = sec[1];
             const Vec2d cp  = params[k];
             const Real  alpha = cp[0];
             const Real  beta  = cp[1];
-
-            const bool b1Valid = beam1IsNode ? (i >= 0 && i     < N1)
-                                             : (i >= 0 && i + 1 < N1);
-            const bool b2Valid = beam2IsNode ? (j >= 0 && j     < N2)
-                                             : (j >= 0 && j + 1 < N2);
-
-            if (!b1Valid || !b2Valid)
+            
+            if (i < 0 || i + 1 >= N1 || j < 0 || j + 1 >= N2)
             {
-                msg_error() << "Contact pair " << k << ": index out of range "
+                msg_error() << "Contact pair " << k << ": section index out of range "
                     << "(i=" << i << " j=" << j
                     << " N1=" << N1 << " N2=" << N2 << "). Skipping.";
-                m_jacCache[k].nBeam1Blocks = 0;
-                m_jacCache[k].nBeam2Blocks = 0;
+
+                ContactJacEntry& entry = m_jacCache[k];
+                entry.normal   = Vec3(Real(0), Real(0), Real(0));
+                entry.tangent1 = Vec3(Real(0), Real(0), Real(0));
+                entry.tangent2 = Vec3(Real(0), Real(0), Real(0));
+                entry.gapNormal   = kInvalidGap;
+                entry.gapTangent1 = Real(0);
+                entry.gapTangent2 = Real(0);
                 return { false, {} };
             }
+            
 
             // ── Contact identity from SSIM (frozen at step start) ───────────────
             // n̂, t̂₁, t̂₂ remain SSIM-frozen by design (Fix A contract).
@@ -309,28 +266,20 @@ namespace Cosserat
             const Vec3 Pc_A_ssim = l_ssim->getSurfacePoint1(k);
             const Vec3 Pc_B_ssim = l_ssim->getSurfacePoint2(k);
 
+            
 
-            Vec3 P_A_in, P_B_in;
-            if (beam1IsNode) {
-                P_A_in = frames1[i].getCenter();
-            } else {
-                P_A_in = frames1[i    ].getCenter() * (Real(1) - alpha)
-                       + frames1[i + 1].getCenter() *  alpha;
-            }
-            if (beam2IsNode) {
-                P_B_in = frames2[j].getCenter();
-            } else {
-                P_B_in = frames2[j    ].getCenter() * (Real(1) - beta)
-                       + frames2[j + 1].getCenter() *  beta;
-            }
+            Vec3 P_A_in = frames1[i].getCenter() * (Real(1) - alpha)
+                   + frames1[i + 1].getCenter() *  alpha;
+
+            Vec3 P_B_in = frames2[j].getCenter() * (Real(1) - beta)
+                   + frames2[j + 1].getCenter() *  beta;
+
 
             // ── Surface points re-based on current input frames ────────────────
             // (Pc_ssim − P_ssim) is r_eff · n̂ along the frozen normal — invariant
             // under the kinematic difference between the SSIM snapshot and the
             // current input. So Pc_A/Pc_B follow the input frames without BCM
             // needing to know r_eff or contactConfiguration.
-            // was: const Vec3 Pc_A = l_ssim->getSurfacePoint1(k);
-            // was: const Vec3 Pc_B = l_ssim->getSurfacePoint2(k);
             const Vec3 Pc_A = P_A_in + (Pc_A_ssim - P_A_ssim);   
             const Vec3 Pc_B = P_B_in + (Pc_B_ssim - P_B_ssim);  
 
@@ -342,32 +291,15 @@ namespace Cosserat
             const Vec3 p_j = frames2[j].getCenter();
 
             ContactJacEntry& entry = m_jacCache[k];
+            
+            const Vec3 p_ip1 = frames1[i + 1].getCenter();
+            entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - p_i   };
+            entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - p_ip1 };
 
-            if (beam1IsNode)
-            {
-                entry.nBeam1Blocks = 1;
-                entry.beam1Blocks[0] = { i, Real(1), Pc_A - p_i };
-            }
-            else
-            {
-                const Vec3 p_ip1 = frames1[i + 1].getCenter();
-                entry.nBeam1Blocks = 2;
-                entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - p_i   };
-                entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - p_ip1 };
-            }
 
-            if (beam2IsNode)
-            {
-                entry.nBeam2Blocks = 1;
-                entry.beam2Blocks[0] = { j, Real(1), Pc_B - p_j };
-            }
-            else
-            {
-                const Vec3 p_jp1 = frames2[j + 1].getCenter();
-                entry.nBeam2Blocks = 2;
-                entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - p_j   };
-                entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - p_jp1 };
-            }
+            const Vec3 p_jp1 = frames2[j + 1].getCenter();
+            entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - p_j   };
+            entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - p_jp1 };
 
             entry.normal   = n;
             entry.tangent1 = t1;
@@ -375,17 +307,15 @@ namespace Cosserat
 
             return { true, { Pc_A, Pc_B, n } };
         };
-
-        // ── Write output positions (monotonic resize only — never shrink) ─────
-        const sofa::Size newK = static_cast<sofa::Size>(K);
+        
 
         if (isGapMode())
         {
             // ── Gap mode: δ = Vec3(δ_n, δ_t1, δ_t2) in contact-local frame ──
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecCoord>>
                 outGap = *dataVecOutPos[0];
-            if (outGap.size() < newK) outGap.resize(newK);
-            for (int k = 0; k < K; ++k)
+            if (outGap.size() < K) outGap.resize(K);
+            for (sofa::Size k = 0; k < K; ++k)
             {
                 auto [ok, g] = computeGeom(k);
                 if (!ok) 
@@ -414,10 +344,10 @@ namespace Cosserat
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecCoord>>
                 out = *dataVecOutPos[0];
 
-            const sofa::Size newK2 = static_cast<sofa::Size>(2 * K);
+            const sofa::Size newK2 = 2 * K;
             if (out.size() < newK2) out.resize(newK2);
 
-            for (int k = 0; k < K; ++k)
+            for (sofa::Size k = 0; k < K; ++k)
             {
                 auto [ok, g] = computeGeom(k);
                 if (!ok)
@@ -441,16 +371,10 @@ namespace Cosserat
         
         auto triads = sofa::helper::getWriteOnlyAccessor(d_contactTriads);
         auto dists  = sofa::helper::getWriteOnlyAccessor(d_distances);
-        if (triads.size() < newK) triads.resize(newK);  
-        if (dists.size()   < newK) dists.resize(newK);
-        for (int k = 0; k < K; ++k)
+        if (triads.size() < K) triads.resize(K);  
+        if (dists.size()   < K) dists.resize(K);
+        for (sofa::Size k = 0; k < K; ++k)
         {
-            if (m_jacCache[k].nBeam1Blocks == 0 || m_jacCache[k].nBeam2Blocks == 0)
-            {
-                triads[k] = ContactTriad{};      // value-initialized: all zeros
-                dists[k]  = Vec3(kInvalidGap, Real(0), Real(0));
-                continue;
-            }
             triads[k].n  = m_jacCache[k].normal;
             triads[k].t1 = m_jacCache[k].tangent1;
             triads[k].t2 = m_jacCache[k].tangent2;
@@ -465,7 +389,7 @@ namespace Cosserat
         // K_now < K_max. Keeps the vector monotonic in size (storeLambda safety)
         // but forces the content to a state CPULC's n̂≈0 filter recognizes as
         // "no contact here".
-        for (sofa::Size k = static_cast<sofa::Size>(K); k < triads.size(); ++k)
+        for (sofa::Size k =K; k < triads.size(); ++k)
         {
             triads[k] = ContactTriad{};                                  // n = t1 = t2 = 0
             dists[k]  = Vec3(kInvalidGap, Real(0), Real(0));             // δn = +∞ → cleared
@@ -504,9 +428,9 @@ namespace Cosserat
         sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<In2VecDeriv>>
             vel2 = *dataVecIn2Vel[0];
 
-        const int  K = static_cast<int>(m_jacCache.size());
-        const sofa::Size newK = static_cast<sofa::Size>(K);
+        const sofa::Size  K = static_cast<int>(m_jacCache.size());
         const bool gapMode = isGapMode();
+        l_ssim->doUpdate();
         const Real s = l_ssim->gapSignForPublishedNormal();
         d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
         
@@ -515,14 +439,14 @@ namespace Cosserat
             // ── Gap mode: single output, δ̇[k] = Ṗc_B[k] − Ṗc_A[k] ───────────────
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecDeriv>>
                 outVel = *dataVecOutVel[0];
-            if (outVel.size() < newK) outVel.resize(newK);
+            if (outVel.size() < K) outVel.resize(K);
 
-            for (int k = 0; k < K; ++k)
+            for (sofa::Size k = 0; k < K; ++k)
             {
                 const ContactJacEntry& entry = m_jacCache[k];
 
                 OutDeriv vcA{};
-                for (int b = 0; b < entry.nBeam1Blocks; ++b)
+                for (int b = 0; b < 2; ++b)
                 {
                     const JacBlock& blk = entry.beam1Blocks[b];
                     vcA += (vel1[blk.frameIdx].getLinear()
@@ -532,7 +456,7 @@ namespace Cosserat
                 }
 
                 OutDeriv vcB{};
-                for (int b = 0; b < entry.nBeam2Blocks; ++b)
+                for (int b = 0; b < 2; ++b)
                 {
                     const JacBlock& blk = entry.beam2Blocks[b];
                     vcB += (vel2[blk.frameIdx].getLinear()
@@ -556,14 +480,14 @@ namespace Cosserat
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecDeriv>>
                 outVel = *dataVecOutVel[0];
 
-            const sofa::Size newK2 = static_cast<sofa::Size>(2 * K);
+            const sofa::Size newK2 = 2 * K;
             if (outVel.size() < newK2) outVel.resize(newK2);
-            for (int k = 0; k < K; ++k)
+            for (sofa::Size k = 0; k < K; ++k)
             {
                 const ContactJacEntry& entry = m_jacCache[k];
 
                 OutDeriv vcA{};
-                for (int b = 0; b < entry.nBeam1Blocks; ++b)
+                for (int b = 0; b < 2; ++b)
                 {
                     const JacBlock& blk = entry.beam1Blocks[b];
                     vcA += (vel1[blk.frameIdx].getLinear()
@@ -573,7 +497,7 @@ namespace Cosserat
                 }
 
                 OutDeriv vcB{};
-                for (int b = 0; b < entry.nBeam2Blocks; ++b)
+                for (int b = 0; b < 2; ++b)
                 {
                     const JacBlock& blk = entry.beam2Blocks[b];
                     vcB += (vel2[blk.frameIdx].getLinear()
@@ -622,8 +546,9 @@ namespace Cosserat
         sofa::helper::WriteAccessor<sofa::core::objectmodel::Data<In2VecDeriv>>
             outF2 = *dataVecOut2Force[0];
 
-        const int  K = static_cast<int>(m_jacCache.size());
+        const sofa::Size  K = static_cast<int>(m_jacCache.size());
         const bool gapMode = isGapMode();
+        l_ssim->doUpdate();
         const Real s = l_ssim->gapSignForPublishedNormal();
         d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
 
@@ -633,9 +558,9 @@ namespace Cosserat
             sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<OutVecDeriv>>
                 inForce = *dataVecInForce[0];
 
-            for (int k = 0; k < K; ++k)
+            for (sofa::Size k = 0; k < K; ++k)
             {
-                if (k >= static_cast<int>(inForce.size())) break;
+                if (k >= inForce.size()) break;
 
                 const ContactJacEntry& entry = m_jacCache[k];
                 
@@ -644,7 +569,7 @@ namespace Cosserat
                              + entry.tangent2 * inForce[k][2];
 
                 // Beam-1 receives negative contribution (Ṗc_A has − sign in δ̇).
-                for (int b = 0; b < entry.nBeam1Blocks; ++b)
+                for (int b = 0; b < 2; ++b)
                 {
                     const JacBlock& blk = entry.beam1Blocks[b];
                     outF1[blk.frameIdx].getLinear()
@@ -654,7 +579,7 @@ namespace Cosserat
                 }
 
                 // Beam-2 receives positive contribution.
-                for (int b = 0; b < entry.nBeam2Blocks; ++b)
+                for (int b = 0; b < 2; ++b)
                 {
                     const JacBlock& blk = entry.beam2Blocks[b];
                     outF2[blk.frameIdx].getLinear()
@@ -672,16 +597,16 @@ namespace Cosserat
             sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<OutVecDeriv>>
                 inForce = *dataVecInForce[0];
 
-            for (int k = 0; k < K; ++k)
+            for (sofa::Size k = 0; k < K; ++k)
             {
                 const ContactJacEntry& entry = m_jacCache[k];
 
                 // Force at Pc_A[k]: even slot → Beam-1.
-                const int slotA = 2 * k;
-                if (slotA < static_cast<int>(inForce.size()))
+                const sofa::Size slotA = 2 * k;
+                if (slotA < inForce.size())
                 {
                     const Vec3 FA = inForce[slotA];
-                    for (int b = 0; b < entry.nBeam1Blocks; ++b)
+                    for (int b = 0; b < 2; ++b)
                     {
                         const JacBlock& blk = entry.beam1Blocks[b];
                         outF1[blk.frameIdx].getLinear()
@@ -692,11 +617,11 @@ namespace Cosserat
                 }
 
                 // Force at Pc_B[k]: odd slot → Beam-2.
-                const int slotB = 2 * k + 1;
-                if (slotB < static_cast<int>(inForce.size()))
+                const sofa::Size slotB = 2 * k + 1;
+                if (slotB < inForce.size())
                 {
                     const Vec3 FB = inForce[slotB];
-                    for (int b = 0; b < entry.nBeam2Blocks; ++b)
+                    for (int b = 0; b < 2; ++b)
                     {
                         const JacBlock& blk = entry.beam2Blocks[b];
                         outF2[blk.frameIdx].getLinear()
@@ -754,10 +679,11 @@ namespace Cosserat
         sofa::helper::WriteAccessor<sofa::core::objectmodel::Data<In2MatrixDeriv>>
             outM2 = *dataMatOut2[0];
         
+        l_ssim->doUpdate();
         const Real s = l_ssim->gapSignForPublishedNormal();
         d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
-
-        const int  K = static_cast<int>(m_jacCache.size());
+    
+        const sofa::Size  K = static_cast<int>(m_jacCache.size());
         const bool gapMode = isGapMode();
 
         if (gapMode)
@@ -776,7 +702,7 @@ namespace Cosserat
 
                 for (auto colIt = rowIt.begin(); colIt != rowIt.end(); ++colIt)
                 {
-                    const int k = static_cast<int>(colIt.index());
+                    const sofa::Size k = colIt.index();
                     if (k < 0 || k >= K) continue;
 
                     const ContactJacEntry& entry = m_jacCache[k];
@@ -786,7 +712,7 @@ namespace Cosserat
                                 + entry.tangent2 * colIt.val()[2];
 
                     // Beam-1: negative Jacobian block (Ṗc_A enters with − in δ̇).
-                    for (int b = 0; b < entry.nBeam1Blocks; ++b)
+                    for (int b = 0; b < 2; ++b)
                     {
                         const JacBlock& blk = entry.beam1Blocks[b];
                         In1Deriv contrib;
@@ -796,7 +722,7 @@ namespace Cosserat
                     }
 
                     // Beam-2: positive Jacobian block.
-                    for (int b = 0; b < entry.nBeam2Blocks; ++b)
+                    for (int b = 0; b < 2; ++b)
                     {
                         const JacBlock& blk = entry.beam2Blocks[b];
                         In2Deriv contrib;
@@ -824,8 +750,8 @@ namespace Cosserat
 
                 for (auto colIt = rowIt.begin(); colIt != rowIt.end(); ++colIt)
                 {
-                    const int col = static_cast<int>(colIt.index());
-                    const int k   = col / 2;
+                    const sofa::Size col = static_cast<sofa::Size>(colIt.index());
+                    const sofa::Size k   = col / 2;
                     if (k < 0 || k >= K) continue;
 
                     const Vec3 d = colIt.val();
@@ -834,7 +760,7 @@ namespace Cosserat
                     if (col % 2 == 0)
                     {
                         // Even column → Pc_A[k] → Beam-1 frames only.
-                        for (int b = 0; b < entry.nBeam1Blocks; ++b)
+                        for (int b = 0; b < 2; ++b)
                         {
                             const JacBlock& blk = entry.beam1Blocks[b];
                             In1Deriv contrib;
@@ -846,7 +772,7 @@ namespace Cosserat
                     else
                     {
                         // Odd column → Pc_B[k] → Beam-2 frames only.
-                        for (int b = 0; b < entry.nBeam2Blocks; ++b)
+                        for (int b = 0; b < 2; ++b)
                         {
                             const JacBlock& blk = entry.beam2Blocks[b];
                             In2Deriv contrib;
@@ -868,7 +794,6 @@ namespace Cosserat
         factory->registerObjects(sofa::core::ObjectRegistrationData(
             "Maps SSIM contact-point descriptors (section IDs + curvilinear parameters) "
             "to two sets of Cosserat beam Rigid3d frames.\n"
-            // MODIFIED: description updated for single-MO contactPoints layout.
             "Both modes use exactly ONE connected output MechanicalObject.\n"
             "Selectable via mappingMode:\n"
             "  'contactPoints': output size = 2K (interleaved). "
@@ -876,7 +801,6 @@ namespace Cosserat
             "applyJT: even force/column indices -> Beam-1, odd -> Beam-2.\n"
             "  'gap': output size = K. "
             "applyJ gives gap velocity; applyJT back-projects with opposite signs to each beam.\n"
-            "Supports ALGO_1 (segment-to-segment) and ALGO_2 (node-to-segment).\n"
             "Implements apply / applyJ / applyJT(VecDeriv) / applyJT(MatrixDeriv) "
             "for use with FreeMotionAnimationLoop + GenericConstraintSolver.")
             .add<BeamContactMapping>());

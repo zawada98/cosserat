@@ -17,8 +17,8 @@ T1_PARAMS = {
     'E':             6e10,
     'v':             0.33,
     'density':       6450,
-    'nb_sections':   50,
-    'nb_frames':     100,
+    'nb_sections':   20,
+    'nb_frames':     50,
     'color':         [0.75, 0.20, 0.75, 0.35],
 }
 
@@ -31,8 +31,8 @@ T2_PARAMS = {
     'E':             6e10,
     'v':             0.33,
     'density':       6450,
-    'nb_sections':   50,
-    'nb_frames':     100,
+    'nb_sections':   20,
+    'nb_frames':     50,
     'color':         [0.15, 0.50, 1.00, 1.0],
 }
 
@@ -462,24 +462,9 @@ def add_cosserat_tube(root_node, p, beam_type,
 
     # ---- Solver scope ----------------------------------------------------
     tube_node   = root_node.addChild(name)
-    solver_node = tube_node.addChild('SolverNode')
-
-    odesolver = solver_node.addObject(
-        'EulerImplicitSolver',
-        name='odesolver',
-        rayleighStiffness=0.2,
-        rayleighMass=0.1,
-        firstOrder=False,
-    )
-    solver_node.addObject(
-        'SparseLDLSolver',
-        name='Solver',
-        template='CompressedRowSparseMatrixd',
-    )
-    solver_node.addObject('GenericConstraintCorrection')
 
     # ---- Rigid base ------------------------------------------------------
-    rigid_base = solver_node.addChild(name + '_rigid_base')
+    rigid_base = tube_node.addChild(name + '_rigid_base')
     base_mo = rigid_base.addObject(
         'MechanicalObject',
         template='Rigid3d',
@@ -498,7 +483,7 @@ def add_cosserat_tube(root_node, p, beam_type,
         )
 
     # ---- Cosserat strain state ------------------------------------------
-    coss_state = solver_node.addChild(name + '_coss_state')
+    coss_state = tube_node.addChild(name + '_coss_state')
     coss_mo = coss_state.addObject(
         'MechanicalObject',
         template='Vec3d',
@@ -521,7 +506,7 @@ def add_cosserat_tube(root_node, p, beam_type,
     # ---- Output frames (single parent: SolverNode) ----------------------
     # DiscreteCosseratMapping reaches both inputs by relative sibling paths;
     # do NOT addChild this node from rigid_base or coss_state.
-    frame_node = solver_node.addChild(name + '_frames')
+    frame_node = tube_node.addChild(name + '_frames')
     frame_node.addObject(
         'MechanicalObject',
         template='Rigid3d',
@@ -543,7 +528,7 @@ def add_cosserat_tube(root_node, p, beam_type,
         radius=re,
     )
 
-    return base_mo, coss_mo, tube_node, frame_node, odesolver
+    return base_mo, coss_mo, tube_node, frame_node
 
 
 # =============================================================================
@@ -755,7 +740,7 @@ def createScene(root_node):
     ])
 
     root_node.gravity = [0., 0., 0.]
-    root_node.dt      = 1e-4
+    root_node.dt      = 1e-3
 
     root_node.addObject('DefaultVisualManagerLoop')
     root_node.addObject('FreeMotionAnimationLoop')
@@ -783,19 +768,35 @@ def createScene(root_node):
                                      'hideMechanicalMappings')
 
     compute_length_of_outer_tube(T1_PARAMS, T2_PARAMS)
+    print("LENGTH OF BEAM IS",T1_PARAMS['length'])
     compute_angle_arc(T1_PARAMS['length'],
                       T2_PARAMS['crv_radius'],
                       T2_PARAMS,
                       factor=1.5)
 
+    shared_solver_node = root_node.addChild('SharedSolver')
+    shared_solver_node.addObject(
+        'EulerImplicitSolver',
+        name='odesolver',
+        rayleighStiffness=0.2,
+        rayleighMass=0.1,
+        firstOrder=False,
+    )
+    shared_solver_node.addObject(
+        'SparseLDLSolver',
+        name='Solver',
+        template='CompressedRowSparseMatrixd',
+    )
+    shared_solver_node.addObject('GenericConstraintCorrection')
+
     # ---- Build tubes --------------------------------------------------------
-    t1_base_mo, _, _, t1_frame_node, t1_solver = add_cosserat_tube(
-        root_node, T1_PARAMS, beam_type='straight',
+    t1_base_mo, _, _, t1_frame_node = add_cosserat_tube(
+        shared_solver_node, T1_PARAMS, beam_type='straight',
         init_strategy='natural',
         fixed_directions=[1, 1, 1, 1, 1, 1],
     )
-    t2_base_mo, _, _, t2_frame_node, t2_solver = add_cosserat_tube(
-        root_node, T2_PARAMS, beam_type='arc',
+    t2_base_mo, _, _, t2_frame_node = add_cosserat_tube(
+        shared_solver_node, T2_PARAMS, beam_type='arc',
         init_strategy='straight',
         outer_params=T1_PARAMS,
         fixed_directions=[1, 0, 1, 1, 1, 0],
@@ -844,10 +845,9 @@ def createScene(root_node):
         radius2=T2_PARAMS['rex'],
         innerRadius1=T1_PARAMS['rin'],
         innerRadius2=T2_PARAMS['rin'],
-        algorithmType=ALGORITHM,
         contactConfiguration = "nested",
         defaultNormal = DEFAULT_NORMAL,
-        broadPhaseMarginFactor = 10
+        broadPhaseMarginFactor = 2
     )
 
     contact_output = t1_frame_node.addChild('contactOutput')
@@ -869,22 +869,13 @@ def createScene(root_node):
     )
 
     contact_output.addObject(
-        'UnilateralLagrangianConstraint',
-        template='Vec3d',
-        name='ulc',
-        object1=contactMO.getLinkPath(),
-        object2=contactMO.getLinkPath(),
-    )
-
-    contact_output.addObject(
-        'ContactFeeder',
-        name='feeder',
-        distances=bcm.getLinkPath() + '.distances',
-        constraint='@ulc',
-        alarmDistance=ALARM_DISTANCE,
-        mu=0.2,
+        'ContactPointsUnilateralConstraint',
+        name='cpuc',
+        mu=0,
         contactTriads=bcm.getLinkPath() + '.contactTriads',
         gapSign=bcm.getLinkPath() + '.gapSign',
+        baumgarteAlpha=0,
+        activationTolerance=1.5e-3,
     )
 
     t2_curv_abs_frames = list(

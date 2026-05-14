@@ -1020,7 +1020,7 @@ class CTRController(Sofa.Core.Controller):
         try:
             dt0 = float(self.root_node.dt.value)
         except Exception:
-            dt0 = 1e-4
+            dt0 = 1e-3
         self._dt_current = dt0
         self._dt_target  = dt0
 
@@ -1246,7 +1246,7 @@ def createScene(root_node):
         t1_max_translation_m=0.04,                  # outer tube slider: 0..4 cm
         t2_max_translation_m=0.08,                  # inner tube slider: 0..8 cm
         max_rotation_rate_deg_per_step=0.5,         # knob: -2..+2 deg/STEP
-        init_dt=1e-4,                               # init phase dt (matches root_node.dt above)
+        init_dt=1e-3,                               # init phase dt (matches root_node.dt above)
         default_control_dt=1e-3,                    # GUI Spinbox suggested value (NOT auto-applied)
         dt_min=1e-6, dt_max=1e-1,                   # allowed range in the Spinbox
     )
@@ -1285,7 +1285,6 @@ def createScene(root_node):
         radius2=T2_PARAMS['rex'],
         innerRadius1=T1_PARAMS['rin'],
         innerRadius2=T2_PARAMS['rin'],
-        algorithmType=ALGORITHM,
         contactConfiguration = "nested",
         defaultNormal = DEFAULT_NORMAL,
         broadPhaseMarginFactor = 1.5

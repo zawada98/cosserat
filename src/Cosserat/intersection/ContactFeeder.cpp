@@ -49,6 +49,9 @@ ContactFeeder::ContactFeeder()
         "gapSign",
         "Global gap sign s ∈ {+1, −1} such that (Pc_B − Pc_A)·n̂ = s·δn.\n"
         "Link to @BCM.gapSign."))
+    , d_contactDistance(initData(&d_contactDistance, Real(1e-3),
+        "contactDistance",
+        "Distance below which a contact is created"))
 {
     // Enable event handling so handleEvent() is called by the simulation loop.
     this->f_listening.setValue(true);
@@ -194,7 +197,7 @@ void ContactFeeder::feedContacts()
 
         Params params(mu);
         cstr->addContact(params, norm,
-                         /*contactDistance=*/Real(0.0),
+                         /*contactDistance=*/Real(d_contactDistance.getValue()),
                          /*m1=*/2*k,
                          /*m2=*/2*k + 1);
     }

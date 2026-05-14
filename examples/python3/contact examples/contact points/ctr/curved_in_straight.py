@@ -17,7 +17,7 @@ T1_PARAMS = {
     'E':             6e10,
     'v':             0.33,
     'density':       6450,
-    'nb_sections':   50,
+    'nb_sections':   20,
     'nb_frames':     50,
     'color':         [0.75, 0.20, 0.75, 0.35],
 }
@@ -31,7 +31,7 @@ T2_PARAMS = {
     'E':             6e10,
     'v':             0.33,
     'density':       6450,
-    'nb_sections':   50,
+    'nb_sections':   20,
     'nb_frames':     50,
     'color':         [0.15, 0.50, 1.00, 1.0],
 }
@@ -845,10 +845,9 @@ def createScene(root_node):
         radius2=T2_PARAMS['rex'],
         innerRadius1=T1_PARAMS['rin'],
         innerRadius2=T2_PARAMS['rin'],
-        algorithmType=ALGORITHM,
         contactConfiguration = "nested",
         defaultNormal = DEFAULT_NORMAL,
-        broadPhaseMarginFactor = 100
+        broadPhaseMarginFactor = 2
     )
 
     contact_output = t1_frame_node.addChild('contactOutput')
@@ -874,7 +873,7 @@ def createScene(root_node):
         name='cpuc',
         mu=0,
         contactTriads=bcm.getLinkPath() + '.contactTriads',
-        gapSign=bcm.getLinkPath() + '.gapSign',
+        gapSign=bcm.getLinkPath() + '.gapSign'
     )
 
     t2_curv_abs_frames = list(

@@ -113,6 +113,8 @@ namespace Cosserat
         /// Global gap sign s ∈ {+1, −1} such that (Pc_B − Pc_A)·n̂ = s·δn.
         /// Link to  @BCM.gapSign .
         sofa::core::objectmodel::Data<Real> d_gapSign;
+        
+        sofa::core::objectmodel::Data<Real> d_contactDistance;
 
         // ── Object link ───────────────────────────────────────────────────────────
 
