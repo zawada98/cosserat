@@ -31,21 +31,19 @@ Run with:
     runSofa scene_SSIM_TwoBeams.py
 """
 
-import os
-import time
-import numpy as np
+
 import matplotlib
 matplotlib.use("Agg")          # non-interactive backend – safe inside runSofa
-import matplotlib.pyplot as plt
-from matplotlib import cm
+
 import math
 import Sofa
 import Sofa.Core
 
-import atexit
-import os
-import time
 
+import os
+
+from live_monitor   import LiveContactMonitor
+from gui2 import CTRGuiBridgeStraightOuter
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -60,17 +58,44 @@ SCENE_DIR = os.path.dirname(os.path.abspath(__file__))
 #  Scene parameters
 # ──────────────────────────────────────────────────────────────────────────────
 BEAM_LENGTH      = 120.0    # [mm]  total length of each beam
-NB_SECTIONS      = 6        # number of Cosserat sections per beam
-NB_FRAMES        = 20       # number of output Rigid3d frames per beam
-RADIUS           = 1.0      # [mm]  cross-section radius
+NB_SECTIONS      = 5        # number of Cosserat sections per beam
+NB_FRAMES        = 10       # number of output Rigid3d frames per beam
+RADIUS1_EX       = 6.0      # [mm]  cross-section radius
+RADIUS1_IN       = 5.0      # [mm]  cross-section radius
+RADIUS2_EX       = 2.0      # [mm]  cross-section radius
+RADIUS2_IN       = 1.0      # [mm]  cross-section radius
 YOUNG_MODULUS    = 3.0e6    # [Pa]
 POISSON_RATIO    = 0.49
 STIFFNESS        = 1.0e8    # base-clamp stiffness  (Beam 2 clamped end)
-ALGORITHM        = "ALGO_1" # "ALGO_1" (segment-seg) or "ALGO_2" (node-seg NR)
-DT               = 0.0001     # [s]   time step
+DT               = 1e-4   # [s]   time step
 MAX_STEPS        = 500      # stop automatically after this many steps
 MAX_K = NB_FRAMES
-ALARM_DISTANCE = 2.0 * RADIUS
+ALARM_DISTANCE = 3.0 * RADIUS2_EX
+
+class JiggleRecorder(Sofa.Core.Controller):
+    def __init__(self, t2_frames_mo, out_path, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mo = t2_frames_mo
+        self.out_path = out_path
+        self.rows = []
+
+    def onAnimateEndEvent(self, event):
+        t = self.getContext().time.value
+        tip = list(self.mo.position.value[-1])[:3]  # last frame center
+        mid = list(self.mo.position.value[len(self.mo.position.value)//2])[:3]
+        self.rows.append((t, *tip, *mid))
+
+    def onSimulationInitDoneEvent(self, event):
+        pass
+
+    def __del__(self):
+        try:
+            with open(self.out_path, 'w') as f:
+                f.write("t,tip_x,tip_y,tip_z,mid_x,mid_y,mid_z\n")
+                for r in self.rows:
+                    f.write(",".join(str(v) for v in r) + "\n")
+        except Exception:
+            pass
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Geometry
@@ -79,13 +104,206 @@ ALARM_DISTANCE = 2.0 * RADIUS
 #  Beam 1 – along global +X, centred at Y=0, Z=0  (fully fixed obstacle)
 #    base at [0, 0, 0], quaternion [0,0,0,1]
 #
-#  Beam 2 – along global +Y, base at [L/2, 0, GAP_Z]
-#    (so it crosses Beam 1 near the mid-span of both)
-#    quaternion for 90° rotation about Z:  [0, 0, sin45°, cos45°]
-#    With gravity in -Z the free end bends down and contacts Beam 1.
+#  Beam 2 – cantilever, clamped at base, free end falls under gravity (−Z).
+#    base at [0, GAP_Y, GAP_Z].
+#
+#    GAP_Z > 0  : Beam 2 starts above Beam 1.
+#    GAP_Y ≠ 0  : lateral eccentricity. Contact normal will lie in the (Y,Z)
+#                 plane, tilted by atan2(GAP_Y, effective vertical gap at
+#                 contact). GAP_Y = 0 reproduces the original axisymmetric
+#                 (purely vertical) configuration.
 #
 # Initial vertical gap between the two parallel beam axes
-GAP_Z = 20.0    # [mm]   must be > 2*RADIUS to start without interpenetration
+GAP_Z = 0.0    # [mm]   must be > 2*RADIUS to start without interpenetration
+GAP_Y = 0.0
+
+class CTRController(Sofa.Core.Controller):
+    """
+    See previous docstring -- behaviour is identical EXCEPT during the
+    'waiting' / 'initializing' phases the controller does NOT touch the
+    inner-tube base. Combined with fixed_directions=None on the inner
+    tube, this lets the rigid base float freely so BOTH ends of the arc
+    relax toward the rest curvature.
+
+    On the transition initializing -> control, the controller captures
+    wherever the inner base has landed and treats that pose as the new
+    "rest" reference: with cumulative DOFs at 0, the first control-phase
+    write yields exactly the captured pose, so there is no snap.
+    """
+
+    DT_RAMP_PER_STEP = 1.02
+
+    def __init__(self,
+                 root_node,
+                 t1_base_mo,
+                 t2_base_mo,
+                 gui_bridge,
+                 *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.root_node  = root_node
+        self.t1_base_mo = t1_base_mo
+        self.t2_base_mo = t2_base_mo
+        self.gui        = gui_bridge
+
+        # Outer: pin to construction-time pose forever.
+        self._t1_rest_pose = list(t1_base_mo.position.value[0])
+
+        # Inner: filled on init->control transition (NOT at construction).
+        self._t2_rest_pose = None
+
+        self._t2_tx = 0.0
+        self._t2_ty = 0.0
+        self._t2_tz = 0.0
+        self._t2_rx = 0.0
+        self._t2_rz = 0.0
+
+        try:
+            dt0 = float(self.root_node.dt.value)
+        except Exception:
+            dt0 = 1e-4
+        self._dt_current = dt0
+        self._dt_target  = dt0
+
+        self._step       = 0
+        self._prev_phase = 'waiting'
+
+        self._init_start_wall = None
+        self._INIT_TIMEOUT_S = 5.0
+
+        # ------------------------------------------------------------------
+    def onAnimateBeginEvent(self, event):
+        self._step += 1
+        snap  = self.gui.snapshot()
+        phase = snap['phase']
+
+        # 1) Outer tube: pin every step regardless of phase.
+        self._write_pose(self.t1_base_mo, self._t1_rest_pose)
+
+        if phase == 'initializing':
+            import time as _time
+            if self._init_start_wall is None:  # first entry
+                self._init_start_wall = _time.monotonic()
+            elapsed = _time.monotonic() - self._init_start_wall
+            if elapsed >= self._INIT_TIMEOUT_S:
+                print(f"[CTRController] init timeout ({self._INIT_TIMEOUT_S:.1f} s "
+                      f"wall clock) — forcing control phase at step {self._step}")
+                self.gui.signal_init_complete()  # flips phase + enables GUI widgets
+                # phase will read 'control' on the next snapshot(); nothing more
+                # needs to happen this step.
+
+        # 2) Detect init -> control transition and snapshot the inner base
+        if self._prev_phase != 'control' and phase == 'control':
+            self._t2_rest_pose = list(self.t2_base_mo.position.value[0])
+            x, y, z, qx, qy, qz, qw = self._t2_rest_pose
+            print(f"[CTRController] init -> control at step {self._step}; "
+                  f"captured inner-tube base pose: "
+                  f"pos=({x:+.4f}, {y:+.4f}, {z:+.4f}) "
+                  f"quat=({qx:+.4f}, {qy:+.4f}, {qz:+.4f}, {qw:+.4f})")
+        self._prev_phase = phase
+
+        # 3) Control phase: dt ramp + DOF advancement + write inner base.
+        if phase == 'control':
+            dt_req = self.gui.consume_dt_request()
+            if dt_req is not None:
+                self._dt_target = float(dt_req)
+                print(f"[CTRController] dt target -> {self._dt_target:.6g} s "
+                      f"at step {self._step}; ramping from "
+                      f"{self._dt_current:.6g} s "
+                      f"at <= {(self.DT_RAMP_PER_STEP - 1) * 100:.1f}% per step")
+
+            if abs(self._dt_current - self._dt_target) > 1e-15:
+                ratio = self._dt_target / self._dt_current
+                if ratio > self.DT_RAMP_PER_STEP:
+                    self._dt_current *= self.DT_RAMP_PER_STEP
+                elif ratio < 1.0 / self.DT_RAMP_PER_STEP:
+                    self._dt_current /= self.DT_RAMP_PER_STEP
+                else:
+                    self._dt_current = self._dt_target
+                try:
+                    self.root_node.dt = self._dt_current
+                except Exception as e:
+                    print(f"[CTRController] failed to write dt: {e!r}")
+
+            max_t = float(snap['translation_step_m'])
+            max_r = float(snap['rotation_step_rad'])
+
+            self._t2_tx = self._step_toward(self._t2_tx,
+                                            float(snap['t2_tx_target_m']),  max_t)
+            self._t2_ty = self._step_toward(self._t2_ty,
+                                            float(snap['t2_ty_target_m']),  max_t)
+            self._t2_tz = self._step_toward(self._t2_tz,
+                                            float(snap['t2_tz_target_m']),  max_t)
+            self._t2_rx = self._step_toward(self._t2_rx,
+                                            float(snap['t2_rx_target_rad']), max_r)
+            self._t2_rz = self._step_toward(self._t2_rz,
+                                            float(snap['t2_rz_target_rad']), max_r)
+
+            pose = self._compose_inner_pose()
+            self._write_pose(self.t2_base_mo, pose)
+
+        # 'waiting' / 'initializing': DO NOT write self.t2_base_mo.
+        # The base floats, the rod curls symmetrically toward rest curvature.
+
+    # ------------------------------------------------------------------
+    def _compose_inner_pose(self):
+        x_rest, y_rest, z_rest = self._t2_rest_pose[0:3]
+        q_rest = tuple(self._t2_rest_pose[3:7])
+
+        new_x = x_rest + self._t2_tx * 1000.0
+        new_y = y_rest + self._t2_ty * 1000.0
+        new_z = z_rest + self._t2_tz * 1000.0
+
+        q_twist = self._quat_x(self._t2_rx)
+        q_yaw   = self._quat_z(self._t2_rz)
+        q_int   = self._quat_mul(q_rest, q_twist)
+        q_out   = self._quat_mul(q_yaw,  q_int)
+        q_out   = self._quat_normalize(q_out)
+
+        return [new_x, new_y, new_z,
+                q_out[0], q_out[1], q_out[2], q_out[3]]
+
+    # ---- (unchanged: _write_pose, _step_toward, _quat_x/z/mul/normalize) --
+    @staticmethod
+    def _write_pose(mo, pose):
+        with mo.position.writeable() as p:
+            p[0] = list(pose)
+
+    @staticmethod
+    def _step_toward(current, target, max_step):
+        delta = target - current
+        if delta >  max_step: return current + max_step
+        if delta < -max_step: return current - max_step
+        return target
+
+    @staticmethod
+    def _quat_x(theta):
+        h = 0.5 * theta
+        return (math.sin(h), 0.0, 0.0, math.cos(h))
+
+    @staticmethod
+    def _quat_z(theta):
+        h = 0.5 * theta
+        return (0.0, 0.0, math.sin(h), math.cos(h))
+
+    @staticmethod
+    def _quat_mul(a, b):
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        return (
+            aw*bx + ax*bw + ay*bz - az*by,
+            aw*by - ax*bz + ay*bw + az*bx,
+            aw*bz + ax*by - ay*bx + az*bw,
+            aw*bw - ax*bx - ay*by - az*bz,
+        )
+
+    @staticmethod
+    def _quat_normalize(q):
+        n2 = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]
+        if n2 < 1e-24:
+            return (0.0, 0.0, 0.0, 1.0)
+        inv = 1.0 / math.sqrt(n2)
+        return (q[0]*inv, q[1]*inv, q[2]*inv, q[3]*inv)
+
 
 def extract_contact_points(parent_node, contactMO, MAX_K):
     even_indices = list(range(0, 2 * MAX_K, 2))
@@ -137,7 +355,7 @@ def _make_frame_params(nb_frames, length):
     return frames, curv_abs, edge_indices
 
 def add_cosserat_beam(parent_node, name, base_pos, base_quat,
-                      nb_sections, nb_frames, length, radius,
+                      nb_sections, nb_frames, length, radius, radius_in,
                       young_modulus, poisson_ratio, stiffness,
                       beam_number,fully_fixed=False):
     """
@@ -168,7 +386,7 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
     beam_node       = parent_node.addChild(name)
     solver_node = beam_node.addChild('solverNode')
     solver_node.addObject('EulerImplicitSolver',
-                          rayleighStiffness=0.2, rayleighMass=0.1)
+                          rayleighStiffness=0.2, rayleighMass=0)
     solver_node.addObject('SparseLDLSolver', name='solver',
                           template='CompressedRowSparseMatrixd')
     #solver_node.addObject('BlockGaussSeidelConstraintSolver', tolerance=1e-5, maxIterations=5e2)
@@ -186,12 +404,6 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
         rigid_base_node.addObject(
             'FixedProjectiveConstraint', name='fixBase',
             indices=[0])
-    else:
-        # ── Clamp the base with a stiff spring (allows small elastic reaction) ─
-        rigid_base_node.addObject(
-            'RestShapeSpringsForceField', name='clamp',
-            stiffness=stiffness, angularStiffness=stiffness,
-            external_points=0, points=0, template='Rigid3d')
 
     coord_node = solver_node.addChild('cosseratCoordinate')
     coord_mo   = coord_node.addObject(
@@ -201,6 +413,7 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
         'BeamHookeLawForceField',
         crossSectionShape='circular',
         length=sec_len, radius=radius,
+        innerRadius = radius_in,
         youngModulus=young_modulus,
         poissonRatio=poisson_ratio)
 
@@ -230,11 +443,28 @@ def add_cosserat_beam(parent_node, name, base_pos, base_quat,
 
     edges_positions = [[x, y, z] for x, y, z, *_ in frames]
 
-    return frame_node, frames
+    return frame_node, frames, base_mo
 
-def add_visual_model(framesNode, frames, rex):
+def add_visual_model(framesNode, frames, rex, color=(0.85, 0.15, 0.15, 1.0)):
+    """
+    Build a tube-shaped visual model around the mapped Rigid3d frames of a
+    Cosserat beam.
+
+    Parameters
+    ----------
+    framesNode : Sofa.Core.Node
+        The node holding the FramesMO (output Rigid3d frames of the beam).
+    frames : list
+        The list of frame positions+quaternions (used here only for its length).
+    rex : float
+        Outer radius of the cross-section [mm] – defines the tube radius.
+    color : sequence of 4 floats, optional
+        RGBA color of the tube surface, each component in [0, 1].
+        Default is red (0.85, 0.15, 0.15, 1.0).
+        Accepts any iterable of 4 floats (tuple, list, numpy array …).
+    """
     N = len(frames)
-    n_sides = 30
+    n_sides = 60
     TWO_PI = 2.0 * math.pi
 
     def _ring_positions(r):
@@ -262,7 +492,7 @@ def add_visual_model(framesNode, frames, rex):
 
 
     for r, color_list, suffix in [
-        (rex, [0.85, 0.15, 0.15, 1.0], 'outer')
+        (rex, list(color), 'outer')
     ]:
         ring_pos = _ring_positions(r) * N
         color_str = " ".join(str(v) for v in color_list)
@@ -373,14 +603,15 @@ def createScene(root_node: Sofa.Core.Node):
     #   Axis:  X ∈ [0, L]   Y = 0   Z = 0
     #   This beam never deforms or translates; it is a rigid obstacle.
     #
-    beam1_framesNode, beam1_frames = add_cosserat_beam(
+    beam1_framesNode, beam1_frames, base_mo1 = add_cosserat_beam(
         root_node, 'Beam1_Fixed',
         base_pos   = [0., 0., 0.],
         base_quat  = [0., 0., 0., 1.],
         nb_sections = NB_SECTIONS,
         nb_frames   = NB_FRAMES,
         length      = BEAM_LENGTH,
-        radius      = RADIUS,
+        radius      = RADIUS1_EX,
+        radius_in   = RADIUS1_IN,
         young_modulus  = YOUNG_MODULUS,
         poisson_ratio  = POISSON_RATIO,
         stiffness      = STIFFNESS,
@@ -389,7 +620,11 @@ def createScene(root_node: Sofa.Core.Node):
     )
 
 
-    add_visual_model(beam1_framesNode, beam1_frames, RADIUS)
+    add_visual_model(beam1_framesNode, beam1_frames,
+                     RADIUS1_IN, color=(0.55, 0.20, 0.75, 0.35))
+
+    add_visual_model(beam1_framesNode, beam1_frames,
+                     RADIUS1_EX, color=(0.55, 0.20, 0.75, 0.35))
 
     # ── Beam 2 – along +X (parallel to Beam 1), CLAMPED at base, free end falls ─
     #
@@ -400,23 +635,48 @@ def createScene(root_node: Sofa.Core.Node):
     #   Gravity acts in -Z: the free end bends downward until it contacts Beam 1.
     #   The base end (X = 0) is held by the RestShapeSpringsForceField clamp.
     #
-    beam2_framesNode, beam2_frames = add_cosserat_beam(
+    beam2_framesNode, beam2_frames, base_mo2 = add_cosserat_beam(
         root_node, 'Beam2_Cantilever',
-        base_pos   = [0., 0., GAP_Z],
+        base_pos   = [0., GAP_Y, GAP_Z],
         base_quat  = [0., 0., 0., 1.],
         nb_sections = NB_SECTIONS,
         nb_frames   = NB_FRAMES,
         length      = BEAM_LENGTH,
-        radius      = RADIUS,
+        radius      = RADIUS2_EX,
+        radius_in   = RADIUS2_IN,
         young_modulus  = YOUNG_MODULUS,
         poisson_ratio  = POISSON_RATIO,
         stiffness      = STIFFNESS,
         beam_number    = 2,
         fully_fixed    = False,
     )
-    add_visual_model(beam2_framesNode,beam2_frames, RADIUS)
+    add_visual_model(beam2_framesNode,beam2_frames,
+                     RADIUS2_EX, color=(0.95, 0.85, 0.15, 1.0))
+    add_visual_model(beam2_framesNode, beam2_frames,
+                     RADIUS2_IN, color=(0.95, 0.85, 0.15, 1.0))
 
     intersection_node = root_node.addChild('IntersectionNode')
+
+    # ---- GUI bridge ---------------------------------------------------------
+    gui_bridge = CTRGuiBridgeStraightOuter(
+        root_node=root_node,
+        max_tx_m=0.04,  # tune for your scene
+        max_ty_m=0.005,
+        max_tz_m=0.025,
+        max_rx_deg=180.0,
+        max_rz_deg=15.0,
+        init_dt=float(root_node.dt.value),
+        default_control_dt=1e-3,
+        dt_min=1e-6, dt_max=1e-1,
+    )
+
+    root_node.addObject(CTRController(
+        name='CTRController',
+        root_node=root_node,
+        t1_base_mo=base_mo1,
+        t2_base_mo=base_mo2,
+        gui_bridge=gui_bridge,
+    ))
 
     beam1_MO = beam1_framesNode.FramesMO
     beam2_MO = beam2_framesNode.FramesMO
@@ -428,8 +688,12 @@ def createScene(root_node: Sofa.Core.Node):
         beam2Frames=beam2_MO.getLinkPath() + '.position',
         beam1Velocities = beam1_MO.getLinkPath() + '.velocity',
         beam2Velocities=beam2_MO.getLinkPath() + '.velocity',
-        radius1=RADIUS,
-        radius2=RADIUS,
+        radius1=RADIUS1_EX,
+        radius2=RADIUS2_EX,
+        innerRadius1 = RADIUS1_IN,
+        innerRadius2 = RADIUS2_IN,
+        contactConfiguration = "nested",
+        defaultNormal = "0 0 -1",
     )
 
     contact_output = beam1_framesNode.addChild('contactOutput')
@@ -438,7 +702,9 @@ def createScene(root_node: Sofa.Core.Node):
     contactMO = contact_output.addObject(
         'MechanicalObject', template='Vec3d',
         name='contactMO_gap',
-        position=[[0., 0., 0.]] * 2*MAX_K)
+        position=[[0., 0., 0.]] * 2*MAX_K,
+    rest_position = [[0., 0., 0.]] * 2 * MAX_K)
+
 
     bcm = contact_output.addObject(
         'BeamContactMapping',
@@ -453,8 +719,31 @@ def createScene(root_node: Sofa.Core.Node):
     contact_output.addObject(
         'ContactPointsUnilateralConstraint',
         name='cpuc',
-        mu = 0.2,
+        mu = 0,
         contactTriads = bcm.getLinkPath() + '.contactTriads',
         gapSign = bcm.getLinkPath() + '.gapSign',
+        activationTolerance = 1e-4,
         )
+
+    t2_curv_abs_frames = list(
+        beam2_framesNode.cosseratMapping.curv_abs_output.value
+    )
+
+    intersection_node.addObject(LiveContactMonitor(
+        name='LiveMonitor',
+        t2_MO=beam2_framesNode.FramesMO,
+        bcm=bcm,
+        contact_mo=contactMO,
+        t2_frame_curv_abs=t2_curv_abs_frames,
+        bridge=gui_bridge,
+        every_n_steps=20,
+        contact_constraint=cpuc,
+        force_unit_scale=1e-3,  # scene units are kg-mm-s; kg*mm/s^2 = 1e-3 N
+    ))
+
+    intersection_node.addObject(JiggleRecorder(
+        name='JiggleRec',
+        t2_frames_mo=beam2_framesNode.FramesMO,
+        out_path=os.path.join(SCENE_DIR, 'jiggle.csv'),
+    ))
     return root_node

@@ -1,14 +1,14 @@
 /******************************************************************************
  * Cosserat Plugin for SOFA Framework                                         *
  *                                                                            *
- * ContactPointsUnilateralConstraint.cpp                                      *
+ * ContactPointsUnilateralConstraint2.cpp                                      *
  *                                                                            *
- * See ContactPointsUnilateralConstraint.h for full documentation.           *
+ * See ContactPointsUnilateralConstraint2.h for full documentation.           *
  ******************************************************************************/
 #include <fstream>
 #include <cstdlib>
 
-#include "ContactPointsUnilateralConstraint.h"
+#include "ContactPointsUnilateralConstraint2.h"
 
 #include <sofa/core/ObjectFactory.h>
 #include <sofa/core/ConstraintParams.h>
@@ -24,24 +24,27 @@ namespace Cosserat
 using sofa::component::constraint::lagrangian::model::UnilateralConstraintResolution;
 using sofa::component::constraint::lagrangian::model::UnilateralConstraintResolutionWithFriction;
     
-    bool traceCpuc()
+    namespace
     {
-        static const bool enabled = std::getenv("COSSERAT_TRACE_CPUC") != nullptr;
+    bool traceCpuc2()
+    {
+        static const bool enabled = std::getenv("COSSERAT_TRACE_CPUC2") != nullptr;
         return enabled;
     }
 
-    std::ofstream& cpucLog() {
+    std::ofstream& cpuc2Log() {
         static std::ofstream f = [] {
             const char* dir = std::getenv("COSSERAT_LOG_DIR");
-            std::string path = (dir ? std::string(dir) + "/" : std::string("")) + "cpuc_log.txt";
+            std::string path = (dir ? std::string(dir) + "/" : std::string("")) + "cpuc2_log.txt";
             return std::ofstream(path, std::ios::out | std::ios::trunc);
         }();
         return f;
     }
+    }
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constructor
 // ─────────────────────────────────────────────────────────────────────────────
-ContactPointsUnilateralConstraint::ContactPointsUnilateralConstraint()
+ContactPointsUnilateralConstraint2::ContactPointsUnilateralConstraint2()
     : Inherit()
     , d_contactTriads(initData(&d_contactTriads,
         "contactTriads",
@@ -61,6 +64,10 @@ ContactPointsUnilateralConstraint::ContactPointsUnilateralConstraint()
         "constraint set. Pairs with δ > tolerance are skipped (no row,\n"
         "no Jacobian). Pairs with δ ≤ tolerance are registered. Default\n"
         "1e-3 (1 mm). Should exceed max free-motion displacement per step."))
+    , d_contactDistance(initData(&d_contactDistance, Real(0),
+        "contactDistance",
+        "Desired surface clearance. BCM2 contactPoints mode already outputs "
+        "surface points, so the default is 0."))
     , d_activeContactPairIndices(initData(&d_activeContactPairIndices,
         "activeContactPairIndices",
         "BCM pair index k for each active contact row that received a normal impulse."))
@@ -73,7 +80,7 @@ ContactPointsUnilateralConstraint::ContactPointsUnilateralConstraint()
 // ─────────────────────────────────────────────────────────────────────────────
 //  init / reinit
 // ─────────────────────────────────────────────────────────────────────────────
-void ContactPointsUnilateralConstraint::init()
+void ContactPointsUnilateralConstraint2::init()
 {
     Inherit::init();
 
@@ -106,9 +113,14 @@ void ContactPointsUnilateralConstraint::init()
     }
 }
 
-void ContactPointsUnilateralConstraint::reinit()
+void ContactPointsUnilateralConstraint2::reinit()
 {
     init();
+}
+
+void ContactPointsUnilateralConstraint2::processGeometricalData()
+{
+    rebuildContacts();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +128,7 @@ void ContactPointsUnilateralConstraint::reinit()
 //
 //  Copies the per-pair triad (n, t1, t2) from d_contactTriads and caches it
 //  per contact.  Zero arithmetic between producer (BCM) and consumer (CPULC).
-void ContactPointsUnilateralConstraint::rebuildContacts()
+void ContactPointsUnilateralConstraint2::rebuildContacts()
 {
     m_constraintRowsBuilt = false;
     const auto& triads = d_contactTriads.getValue();
@@ -171,10 +183,25 @@ void ContactPointsUnilateralConstraint::rebuildContacts()
         
         const VecCoord& xMO = this->mstate->read(
         sofa::core::vec_id::read_access::position)->getValue();
-        c.Q = xMO[2 * k];        // Pc_A — Beam-1 surface
-        c.P = xMO[2 * k + 1];    // Pc_B — Beam-2 surface
-        
-        const Real delta_k = m_sign * sofa::type::dot(c.P - c.Q, c.n);
+        const VecCoord& xfreeMO = this->mstate->read(
+        sofa::core::vec_id::read_access::freePosition)->getValue();
+
+        if (2 * k + 1 >= xfreeMO.size())
+        {
+            msg_error() << "Contact pair " << k
+                        << " requires freePosition slots " << (2 * k)
+                        << " and " << (2 * k + 1)
+                        << " but freePosition size=" << xfreeMO.size()
+                        << ". Registering only pairs [0," << k << ").";
+            break;
+        }
+        c.Q = xMO[2 * k];
+        c.P = xMO[2 * k + 1];
+        c.Qfree = xfreeMO[2 * k];
+        c.Pfree = xfreeMO[2 * k + 1];
+
+        const Real delta_k = m_sign * sofa::type::dot(c.P - c.Q, c.n)
+                           - d_contactDistance.getValue();
         if (delta_k > d_activationTolerance.getValue())
             continue;
 
@@ -190,13 +217,14 @@ void ContactPointsUnilateralConstraint::rebuildContacts()
 // ─────────────────────────────────────────────────────────────────────────────
 //  buildConstraintMatrix
 // ─────────────────────────────────────────────────────────────────────────────
-void ContactPointsUnilateralConstraint::buildConstraintMatrix(
+void ContactPointsUnilateralConstraint2::buildConstraintMatrix(
     const sofa::core::ConstraintParams* /*cParams*/,
     DataMatrixDeriv& c_d,
     unsigned int&    cIndex,
     const DataVecCoord& /*x*/)
 {
-    rebuildContacts();
+    if (m_contacts.empty())
+        rebuildContacts();
     
     if (m_contacts.empty()) return;
 
@@ -235,7 +263,7 @@ void ContactPointsUnilateralConstraint::buildConstraintMatrix(
 //  getConstraintViolation
 // ─────────────────────────────────────────────────────────────────────────────
 
-void ContactPointsUnilateralConstraint::getConstraintViolation(
+void ContactPointsUnilateralConstraint2::getConstraintViolation(
     const sofa::core::ConstraintParams* cParams,
     sofa::linearalgebra::BaseVector*    v,
     const DataVecCoord&                 xfree_d,
@@ -245,9 +273,6 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
     if (!m_constraintRowsBuilt) return;    
     if (m_contacts.empty()) return;
         
-    const VecCoord& xfree     = this->mstate->read(
-                                sofa::core::vec_id::read_access::freePosition)->getValue();
-
     const bool posOrder =
         (cParams->constOrder() == sofa::core::ConstraintOrder::POS ||
          cParams->constOrder() == sofa::core::ConstraintOrder::POS_AND_VEL);
@@ -256,16 +281,10 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
 
     if (posOrder)
     {
-        const VecDeriv& vfree =
-        this->mstate->read(sofa::core::vec_id::read_access::freeVelocity)->getValue();
-        const SReal dt = this->getContext()->getDt();
         for (Contact& con : m_contacts)
         {
-            const int m1 = 2 * con.k;
-            const int m2 = 2 * con.k + 1;
-            
-            const Coord& Pfree = xfree[m2];
-            const Coord& Qfree = xfree[m1];
+            const Coord& Pfree = con.Pfree;
+            const Coord& Qfree = con.Qfree;
             const Coord& P     = con.P;
             const Coord& Q     = con.Q;
 
@@ -273,17 +292,17 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
             const Coord QQfree = Qfree - Q;
             const Real  ref_dist = PPfree.norm() + QQfree.norm();
             
-            const Real dfree_pred = m_sign * sofa::type::dot(Pfree - Qfree, con.n);
-            const Real delta      = m_sign * sofa::type::dot(P     - Q    , con.n);
-            const Real dfree = std::min(dfree_pred, delta);
-            //const Real dfree = dfree_pred;
-            
+            const Real dfree = m_sign * sofa::type::dot(Pfree - Qfree, con.n)
+                             - d_contactDistance.getValue();
+            const Real delta = m_sign * sofa::type::dot(P - Q, con.n)
+                             - d_contactDistance.getValue();
+
             v->set(con.cId, dfree);
             con.dfree_n = dfree;
-            if (traceCpuc())
+            if (traceCpuc2())
             {
-                auto& log = cpucLog();
-                log << "[CPUC-RAW] t=" << this->getContext()->getTime()
+                auto& log = cpuc2Log();
+                log << "[CPUC2-RAW] t=" << this->getContext()->getTime()
                     << " k="     << con.k
                     << " P=("    << P[0]     << "," << P[1]     << "," << P[2]     << ")"
                     << " Pfree=("<< Pfree[0] << "," << Pfree[1] << "," << Pfree[2] << ")"
@@ -368,7 +387,8 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
             const Deriv QP_vfree = vfree[m2] - vfree[m1];
             const Deriv dVec     = QP_vfree + QP_invDt;
 
-            v->set(con.cId, m_sign * sofa::type::dot(dVec, con.n));
+            v->set(con.cId, m_sign * sofa::type::dot(dVec, con.n)
+                            - d_contactDistance.getValue() * invDt);
 
             if (withFriction)
             {
@@ -382,7 +402,7 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
 // ─────────────────────────────────────────────────────────────────────────────
 //  getConstraintResolution
 // ─────────────────────────────────────────────────────────────────────────────
-void ContactPointsUnilateralConstraint::getConstraintResolution(
+void ContactPointsUnilateralConstraint2::getConstraintResolution(
     const sofa::core::ConstraintParams* /*cParams*/,
     std::vector<sofa::core::behavior::ConstraintResolution*>& resTab,
     unsigned int& offset)
@@ -428,7 +448,7 @@ void ContactPointsUnilateralConstraint::getConstraintResolution(
 // ─────────────────────────────────────────────────────────────────────────────
 //  isActive
 // ─────────────────────────────────────────────────────────────────────────────
-bool ContactPointsUnilateralConstraint::isActive() const
+bool ContactPointsUnilateralConstraint2::isActive() const
 {
     return !m_contacts.empty();  
 }
@@ -436,7 +456,7 @@ bool ContactPointsUnilateralConstraint::isActive() const
 // ─────────────────────────────────────────────────────────────────────────────
 //  draw — normal + (if friction) tangents, rooted at each surface point.
 // ─────────────────────────────────────────────────────────────────────────────
-void ContactPointsUnilateralConstraint::draw(
+void ContactPointsUnilateralConstraint2::draw(
     const sofa::core::visual::VisualParams* vparams)
 {
     if (!vparams->displayFlags().getShowInteractionForceFields()) return;
@@ -483,7 +503,7 @@ void ContactPointsUnilateralConstraint::draw(
     vparams->drawTool()->drawLines(verts, 3, cols);
 }
     
-    void ContactPointsUnilateralConstraint::storeLambda(
+    void ContactPointsUnilateralConstraint2::storeLambda(
         const sofa::core::ConstraintParams* cParams,
         sofa::core::MultiVecDerivId res,
         const sofa::linearalgebra::BaseVector* lambda)
@@ -508,16 +528,16 @@ void ContactPointsUnilateralConstraint::draw(
     d_activeContactPairIndices.setValue(pairIds);
     d_normalContactImpulses.setValue(normalImpulses);
 
-    if (!traceCpuc()) return;
+    if (!traceCpuc2()) return;
 
-    auto& log = cpucLog();
+    auto& log = cpuc2Log();
     for (const Contact& con : m_contacts)
     {
         const SReal lam_n  = lambda->element(con.cId);
         const SReal lam_t1 = fric ? lambda->element(con.cId + 1) : 0.0;
         const SReal lam_t2 = fric ? lambda->element(con.cId + 2) : 0.0;
 
-        log << "[CPUC] t=" << t
+        log << "[CPUC2] t=" << t
             << " k="      << con.k
             << " cId="    << con.cId
             << " dfree="  << con.dfree_n
@@ -532,7 +552,7 @@ void ContactPointsUnilateralConstraint::draw(
 // ─────────────────────────────────────────────────────────────────────────────
 //  Factory registration
 // ─────────────────────────────────────────────────────────────────────────────
-void registerContactPointsUnilateralConstraint(sofa::core::ObjectFactory* factory)
+void registerContactPointsUnilateralConstraint2(sofa::core::ObjectFactory* factory)
 {
     factory->registerObjects(
         sofa::core::ObjectRegistrationData(
@@ -555,12 +575,14 @@ void registerContactPointsUnilateralConstraint(sofa::core::ObjectFactory* factor
             "\n"
             "Scene usage:\n"
             "  contact_node.addObject(\n"
-            "      'ContactPointsUnilateralConstraint',\n"
+            "      'ContactPointsUnilateralConstraint2',\n"
             "      name          = 'cpulc',\n"
             "      contactTriads = '@../bcm.contactTriads',\n"
             "      gapSign       = '@../bcm.gapSign',\n"
             "      mu            = 0.0)")
-        .add<ContactPointsUnilateralConstraint>());
+        .add<ContactPointsUnilateralConstraint2>());
 }
 
 } // namespace Cosserat
+
+

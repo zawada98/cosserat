@@ -27,6 +27,7 @@
  // that was already __declspec(dllimport) in the same TU causes a
  // dllexport/dllimport conflict on MSVC.
 #include <sofa/core/Multi2Mapping.inl>
+#include <cstdlib>
 #include <fstream>
 namespace sofa::core
 {
@@ -39,6 +40,21 @@ namespace sofa::core
 
 namespace Cosserat
 {
+    namespace
+    {
+        bool traceBeamContactMapping()
+        {
+            static const bool enabled = std::getenv("COSSERAT_TRACE_BCM") != nullptr;
+            return enabled;
+        }
+
+        std::ofstream& bcmGapTraceLog()
+        {
+            static std::ofstream f("bcm_gap_trace_log.txt", std::ios::out | std::ios::trunc);
+            return f;
+        }
+    }
+
     BeamContactMapping::BeamContactMapping()
         : Inherit1()
         , l_ssim(initLink("ssim",
@@ -179,14 +195,17 @@ namespace Cosserat
         const sofa::type::vector<const sofa::core::objectmodel::Data<In2VecCoord>*>&
         dataVecIn2Pos)
     {
-        static std::ofstream bcmlog("bcm_apply_log.txt", std::ios::out | std::ios::trunc);
-        bcmlog << "[BCM.apply] t=" << this->getContext()->getTime()
-                << " xId=" << (mparams ? mparams->x().getName() : "null")
-               << " outPtr="  << static_cast<const void*>(dataVecOutPos[0])
-               << " in1Ptr="  << static_cast<const void*>(dataVecIn1Pos[0])
-               << " in2Ptr="  << static_cast<const void*>(dataVecIn2Pos[0])
-               << "\n";
-        bcmlog.flush();
+        if (traceBeamContactMapping())
+        {
+            static std::ofstream bcmlog("bcm_apply_log.txt", std::ios::out | std::ios::trunc);
+            bcmlog << "[BCM.apply] t=" << this->getContext()->getTime()
+                    << " xId=" << (mparams ? mparams->x().getName() : "null")
+                   << " outPtr="  << static_cast<const void*>(dataVecOutPos[0])
+                   << " in1Ptr="  << static_cast<const void*>(dataVecIn1Pos[0])
+                   << " in2Ptr="  << static_cast<const void*>(dataVecIn2Pos[0])
+                   << "\n";
+            bcmlog.flush();
+        }
         
         if (!l_ssim.get())
         {
@@ -225,7 +244,15 @@ namespace Cosserat
         //   - tangent t̂₂        → entry.tangent2 (from SSIM)  
         //
         // NOTHING is recomputed that SSIM already provides.
-        struct ContactGeom { Vec3 Pc_A, Pc_B, n; };
+        struct ContactGeom
+        {
+            Vec3 Pc_A;
+            Vec3 Pc_B;
+            Vec3 n;
+            Vec2i sec;
+            Vec2d cp;
+            Vec3 ssimDistance;
+        };
 
         auto computeGeom = [&](sofa::Size k) -> std::pair<bool, ContactGeom>
         {
@@ -305,7 +332,33 @@ namespace Cosserat
             entry.tangent1 = t1;
             entry.tangent2 = t2;
 
-            return { true, { Pc_A, Pc_B, n } };
+            return { true, { Pc_A, Pc_B, n, sec, cp, l_ssim->getDistances(k) } };
+        };
+
+        auto logGapTrace = [&](const char* mode, sofa::Size k, const ContactGeom& g)
+        {
+            if (!traceBeamContactMapping())
+                return;
+
+            const Real gapSign = l_ssim->gapSignForPublishedNormal();
+            const Real cpGap = gapSign * ((g.Pc_B - g.Pc_A) * g.n);
+            auto& log = bcmGapTraceLog();
+            log << "[BCM-GAP] t=" << this->getContext()->getTime()
+                << " mode=" << mode
+                << " K=" << K
+                << " k=" << k
+                << " sec=(" << g.sec[0] << "," << g.sec[1] << ")"
+                << " ab=(" << g.cp[0] << "," << g.cp[1] << ")"
+                << " gapSign=" << gapSign
+                << " ssimGap=" << g.ssimDistance[0]
+                << " cpGap=" << cpGap
+                << " diff=" << (cpGap - g.ssimDistance[0])
+                << " ssimTang=(" << g.ssimDistance[1] << "," << g.ssimDistance[2] << ")"
+                << " PcA=(" << g.Pc_A[0] << "," << g.Pc_A[1] << "," << g.Pc_A[2] << ")"
+                << " PcB=(" << g.Pc_B[0] << "," << g.Pc_B[1] << "," << g.Pc_B[2] << ")"
+                << " n=(" << g.n[0] << "," << g.n[1] << "," << g.n[2] << ")"
+                << "\n";
+            log.flush();
         };
         
 
@@ -327,10 +380,11 @@ namespace Cosserat
                     continue;
                 }
                 
-                const Vec3 d = l_ssim->getDistances(k); 
+                const Vec3 d = g.ssimDistance;
                 m_jacCache[k].gapNormal   = d[0];        
                 m_jacCache[k].gapTangent1 = d[1];      
                 m_jacCache[k].gapTangent2 = d[2];      
+                logGapTrace("gap", k, g);
                 
                 outGap[k] = Vec3(
                     m_jacCache[k].gapNormal,    
@@ -359,10 +413,11 @@ namespace Cosserat
                     m_jacCache[k].gapTangent2 = Real(0);
                     continue;
                 }
-                const Vec3 d = l_ssim->getDistances(k); 
+                const Vec3 d = g.ssimDistance;
                 m_jacCache[k].gapNormal   = d[0];        
                 m_jacCache[k].gapTangent1 = d[1];      
                 m_jacCache[k].gapTangent2 = d[2]; 
+                logGapTrace("contactPoints", k, g);
                 out[2 * k]     = g.Pc_A;
                 out[2 * k + 1] = g.Pc_B;
             }
@@ -412,7 +467,7 @@ namespace Cosserat
     //    outVel[0][k] = δ̇[k] = Ṗc_B[k] − Ṗc_A[k]
     // ─────────────────────────────────────────────────────────────────────────────
     void BeamContactMapping::applyJ(
-        const sofa::core::MechanicalParams* /*mparams*/,
+        const sofa::core::MechanicalParams* mparams,
         const sofa::type::vector<sofa::core::objectmodel::Data<OutVecDeriv>*>&
         dataVecOutVel,
         const sofa::type::vector<const sofa::core::objectmodel::Data<In1VecDeriv>*>&
@@ -420,6 +475,21 @@ namespace Cosserat
         const sofa::type::vector<const sofa::core::objectmodel::Data<In2VecDeriv>*>&
         dataVecIn2Vel)
     {
+        
+        if (traceBeamContactMapping())
+        {
+            static std::ofstream bcmlog("bcm_mapping_applyJ_log.txt",
+                                       std::ios::out | std::ios::trunc);
+            bcmlog << "[BCM.applyJ] t=" << this->getContext()->getTime()
+                  << " mapping=" << this->getName()
+                  << " dxId="      << (mparams ? mparams->dx().getName() : "null")
+                  << " vId="       << (mparams ? mparams->v().getName()  : "null")
+                  << " outPtr="  << static_cast<const void*>(dataVecOutVel[0])
+                  << " in1Ptr="  << static_cast<const void*>(dataVecIn1Vel[0])
+                  << " in2Ptr="  << static_cast<const void*>(dataVecIn2Vel[0])
+                  << "\n";
+            bcmlog.flush();
+        }
         if (dataVecIn1Vel.empty() || dataVecIn2Vel.empty() || dataVecOutVel.empty())
             return;
 

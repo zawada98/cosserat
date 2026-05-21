@@ -1,7 +1,7 @@
 /******************************************************************************
  * Cosserat Plugin for SOFA Framework                                         *
  *                                                                            *
- * ContactPointsUnilateralConstraint.h                                        *
+ * ContactPointsUnilateralConstraint2.h                                        *
  *                                                                            *
  * Single-MO unilateral contact constraint for the BeamContactMapping         *
  * "contactPoints" pipeline.                                                  *
@@ -45,12 +45,12 @@ namespace sofa::core { class ObjectFactory; }
 namespace Cosserat
 {
 
-class SOFA_COSSERAT_API ContactPointsUnilateralConstraint
+class SOFA_COSSERAT_API ContactPointsUnilateralConstraint2
     : public sofa::core::behavior::LagrangianConstraint<sofa::defaulttype::Vec3Types>
 {
 public:
     SOFA_CLASS(
-        ContactPointsUnilateralConstraint,
+        ContactPointsUnilateralConstraint2,
         SOFA_TEMPLATE(sofa::core::behavior::LagrangianConstraint,
                       sofa::defaulttype::Vec3Types));
 
@@ -99,6 +99,8 @@ public:
     /// maximum single-step free-motion displacement of either body.
     sofa::core::objectmodel::Data<Real> d_activationTolerance;
 
+    sofa::core::objectmodel::Data<Real> d_contactDistance;
+
     /// BCM pair indices for contacts that built constraint rows last step.
     /// Aligned one-to-one with d_normalContactImpulses.
     sofa::core::objectmodel::Data<sofa::type::vector<int>> d_activeContactPairIndices;
@@ -108,11 +110,13 @@ public:
     sofa::core::objectmodel::Data<sofa::type::vector<Real>> d_normalContactImpulses;
     
     // ── SOFA lifecycle ───────────────────────────────────────────────────────
-    ContactPointsUnilateralConstraint();
-    ~ContactPointsUnilateralConstraint() override = default;
+    ContactPointsUnilateralConstraint2();
+    ~ContactPointsUnilateralConstraint2() override = default;
 
     void init()   override;
     void reinit() override;
+
+    void processGeometricalData() override;
 
     // ── LagrangianConstraint overrides ───────────────────────────────────────
 
@@ -152,6 +156,8 @@ private:
         int          k;       ///< pair index in SSIM/BCM outputs
         Coord        P;       ///< Pc_B snapshot taken at buildConstraintMatrix time
         Coord        Q;       ///< Pc_A snapshot taken at buildConstraintMatrix time
+        Coord        Pfree;
+        Coord        Qfree;
         Vec3         n;       ///< n̂[k]   
         Vec3         t1;       ///< t̂₁[k]   (valid only when μ > 0)
         Vec3         t2;       ///< t̂₂[k]   (valid only when μ > 0)
@@ -179,6 +185,6 @@ private:
 };
 
 /// Factory registration — call from the Cosserat plugin initExternalModule().
-void registerContactPointsUnilateralConstraint(sofa::core::ObjectFactory* factory);
+void registerContactPointsUnilateralConstraint2(sofa::core::ObjectFactory* factory);
 
 } // namespace Cosserat

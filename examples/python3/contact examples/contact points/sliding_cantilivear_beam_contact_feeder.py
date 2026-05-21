@@ -67,7 +67,6 @@ RADIUS2          = 1.0      # [mm]  cross-section radius
 YOUNG_MODULUS    = 3.0e6    # [Pa]
 POISSON_RATIO    = 0.49
 STIFFNESS        = 1.0e8    # base-clamp stiffness  (Beam 2 clamped end)
-ALGORITHM        = "ALGO_1" # "ALGO_1" (segment-seg) or "ALGO_2" (node-seg NR)
 DT               = 0.0001     # [s]   time step
 MAX_STEPS        = 500      # stop automatically after this many steps
 MAX_K = NB_FRAMES
@@ -91,7 +90,7 @@ ALARM_DISTANCE = RADIUS2
 #
 # Initial vertical gap between the two parallel beam axes
 GAP_Z = 10.0    # [mm]   must be > 2*RADIUS to start without interpenetration
-GAP_Y = 0
+GAP_Y = 5
 
 def extract_contact_points(parent_node, contactMO, MAX_K):
     even_indices = list(range(0, 2 * MAX_K, 2))
@@ -436,7 +435,6 @@ def createScene(root_node: Sofa.Core.Node):
         beam2Velocities=beam2_MO.getLinkPath() + '.velocity',
         radius1=RADIUS1,
         radius2=RADIUS2,
-        algorithmType=ALGORITHM,
     )
 
     contact_output = beam1_framesNode.addChild('contactOutput')
@@ -471,7 +469,8 @@ def createScene(root_node: Sofa.Core.Node):
         distances     = bcm.getLinkPath()  + '.distances',
         constraint='@ulc',
         alarmDistance=ALARM_DISTANCE,
-        mu=0.2,
+        mu=0,
+        contactDistance = 0,
         contactTriads=bcm.getLinkPath() + '.contactTriads',
         gapSign=bcm.getLinkPath() + '.gapSign',
     )

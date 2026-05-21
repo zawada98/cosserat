@@ -56,6 +56,7 @@ extern void registerRigidDistanceMapping(sofa::core::ObjectFactory* factory);
 extern void registerSphereSweptIntersectionMethod(sofa::core::ObjectFactory* factory);
 extern void registerBeamContactMapping(sofa::core::ObjectFactory* factory);
 extern void registerContactPointsUnilateralConstraint(sofa::core::ObjectFactory* factory);
+extern void registerContactPointsUnilateralConstraint2(sofa::core::ObjectFactory* factory);
 extern void registerContactFeeder(sofa::core::ObjectFactory* factory);
 
 
@@ -112,6 +113,7 @@ void registerObjects(sofa::core::ObjectFactory* factory)
   registerSphereSweptIntersectionMethod(factory);
   registerBeamContactMapping(factory);
   registerContactPointsUnilateralConstraint(factory);
+  registerContactPointsUnilateralConstraint2(factory);
   registerContactFeeder(factory);
 }
 

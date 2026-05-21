@@ -32,10 +32,20 @@
 #include <sofa/helper/logging/Message.h>
 #include <sofa/helper/visual/DrawTool.h>
 #include <sofa/type/Quat.h>
+#include <cstdlib>
 #include <string>
 #include <fstream>   // std::ofstream
 #include <ostream> 
 namespace Cosserat::mapping {
+
+namespace
+{
+bool traceDiscreteCosseratMapping()
+{
+  static const bool enabled = std::getenv("COSSERAT_TRACE_DISCRETE_MAPPING") != nullptr;
+  return enabled;
+}
+}
 
 using sofa::core::objectmodel::BaseContext;
 using sofa::defaulttype::SolidTypes;
@@ -101,14 +111,17 @@ void DiscreteCosseratMapping<TIn1, TIn2, TOut>::apply(
     const vector<const sofa::DataVecCoord_t<In2> *> &dataVecIn2Pos) {
   
   
-  static std::ofstream dcmlog("discretemapping_apply_log.txt", std::ios::out | std::ios::trunc);
-  dcmlog << "[BCM.apply] t=" << this->getContext()->getTime()
-          << " xId=" << (mparams ? mparams->x().getName() : "null")
-         << " outPtr="  << static_cast<const void*>(dataVecOutPos[0])
-         << " in1Ptr="  << static_cast<const void*>(dataVecIn1Pos[0])
-         << " in2Ptr="  << static_cast<const void*>(dataVecIn2Pos[0])
-         << "\n";
-  dcmlog.flush();
+  if (traceDiscreteCosseratMapping())
+  {
+    static std::ofstream dcmlog("discretemapping_apply_log.txt", std::ios::out | std::ios::trunc);
+    dcmlog << "[DCM.apply] t=" << this->getContext()->getTime()
+            << " xId=" << (mparams ? mparams->x().getName() : "null")
+           << " outPtr="  << static_cast<const void*>(dataVecOutPos[0])
+           << " in1Ptr="  << static_cast<const void*>(dataVecIn1Pos[0])
+           << " in2Ptr="  << static_cast<const void*>(dataVecIn2Pos[0])
+           << "\n";
+    dcmlog.flush();
+  }
   
   if (dataVecOutPos.empty() || dataVecIn1Pos.empty() || dataVecIn2Pos.empty())
     return;

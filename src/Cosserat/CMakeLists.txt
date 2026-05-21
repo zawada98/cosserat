@@ -6,6 +6,7 @@ set(HEADER_FILES
     mapping/BaseCosserat.h
     mapping/BaseCosserat.inl
     mapping/BeamContactMapping.h
+    mapping/BeamContactMapping2.h
     mapping/DiscreteCosseratMapping.h
     mapping/DiscreteCosseratMapping.inl
     mapping/DiscretDynamicCosseratMapping.h
@@ -39,8 +40,10 @@ set(HEADER_FILES
     constraint/CosseratNeedleSlidingConstraint.h
     constraint/CosseratNeedleSlidingConstraint.inl
     constraint/ContactPointsUnilateralConstraint.h
+    constraint/ContactPointsUnilateralConstraint2.h
 
     intersection/SphereSweptIntersectionMethod.h
+    intersection/SphereSweptIntersectionMethod2.h
     intersection/ContactFeeder.h
 
     )
@@ -50,6 +53,7 @@ set(SOURCE_FILES
 
     mapping/BaseCosserat.cpp
     mapping/BeamContactMapping.cpp
+    mapping/BeamContactMapping2.cpp
     mapping/DiscreteCosseratMapping.cpp
     mapping/DiscreteDynamicCosseratMapping.cpp
     mapping/DifferenceMultiMapping.cpp
@@ -67,7 +71,9 @@ set(SOURCE_FILES
     constraint/QPSlidingConstraint.cpp
     constraint/CosseratNeedleSlidingConstraint.cpp
     constraint/ContactPointsUnilateralConstraint.cpp
+    constraint/ContactPointsUnilateralConstraint2.cpp
     intersection/SphereSweptIntersectionMethod.cpp 
+    intersection/SphereSweptIntersectionMethod2.cpp
     intersection/ContactFeeder.cpp
     )
 

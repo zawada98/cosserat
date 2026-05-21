@@ -178,7 +178,7 @@ namespace Cosserat
         sofa::Data<VecRigidDeriv> d_beam1Velocities;                   
         /// Rigid3d frame velocities of Beam 2. Same as above.
         sofa::Data<VecRigidDeriv> d_beam2Velocities;  
-
+    	
         /// Outer cross-section radius of Beam 1
         sofa::Data<Real>          d_radius1;
         /// Outer cross-section radius of Beam 2

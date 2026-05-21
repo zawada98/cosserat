@@ -71,6 +71,7 @@ DT               = 0.0001     # [s]   time step
 MAX_STEPS        = 500      # stop automatically after this many steps
 MAX_K = NB_FRAMES
 ALARM_DISTANCE = 2.0 * RADIUS
+CONTACT_DISTANCE = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Geometry
@@ -449,12 +450,23 @@ def createScene(root_node: Sofa.Core.Node):
         ssim = ssim.getLinkPath(),
         mappingMode='contactPoints'
     )
-
     contact_output.addObject(
-        'ContactPointsUnilateralConstraint',
-        name='cpuc',
-        mu = 0.2,
-        contactTriads = bcm.getLinkPath() + '.contactTriads',
-        gapSign = bcm.getLinkPath() + '.gapSign',
-        )
+        'UnilateralLagrangianConstraint',
+        template='Vec3d',
+        name='ulc',
+        object1=contactMO.getLinkPath(),
+        object2=contactMO.getLinkPath(),
+    )
+
+    feeder = contact_output.addObject(
+        'ContactFeeder',
+        name='feeder',
+        distances=bcm.getLinkPath() + '.distances',
+        constraint='@ulc',
+        alarmDistance=ALARM_DISTANCE,
+        mu=0,
+        contactDistance=0,
+        contactTriads=bcm.getLinkPath() + '.contactTriads',
+        gapSign=bcm.getLinkPath() + '.gapSign',
+    )
     return root_node
