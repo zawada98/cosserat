@@ -139,6 +139,7 @@ T1_PARAMS = {
     'crv_radius':    0.12,        # curvature radius [m]
     'crv_angle_deg': 14.32,
     'rex':           15e-4,       # outer radius [m]
+    'rex':           15e-4,       # outer radius [m]
     'rin':           13.5e-4,     # inner (lumen) radius [m]
     'E':             6e10,
     'v':             0.33,
@@ -200,7 +201,7 @@ STIFFNESS        = 1.0e8
 # Timestep policy:
 #   INIT_DT is used only while the inner tube relaxes into its startup state.
 #   CONTROL_DT is restored when InitializationMonitor hands control to the GUI.
-INIT_DT          = 5.0e-3
+INIT_DT          = 1.0e-4
 CONTROL_DT       = 1.0e-4
 
 # =============================================================================
@@ -825,14 +826,18 @@ def add_cosserat_tube(root_node,
     solver_node = tube_node.addChild('SolverNode')
     odesolver = solver_node.addObject('EulerImplicitSolver',
                           name='odesolver',
-                          rayleighStiffness=2,
+                          rayleighStiffness=1e-2,
                           rayleighMass=0.01,
                           firstOrder=True)
+
     solver_node.addObject('SparseLDLSolver',
                           name='Solver',
                           template='CompressedRowSparseMatrixd')
 
-    solver_node.addObject('GenericConstraintCorrection')
+    solver_node.addObject('GenericConstraintCorrection',
+                          linearSolver='@Solver',
+                          regularizationTerm=1e-8
+                          )
 
     # ---- Rigid base ----------------------------------------------------------
     rigid_base = solver_node.addChild(name + '_rigid_base')
@@ -840,13 +845,11 @@ def add_cosserat_tube(root_node,
         'MechanicalObject',
         template='Rigid3d',
         name='cosserat_base_mo',
-        # x_offset applied so Tube_3's kinematic root starts at x = -160 mm.
-        # Tube_1 receives x_offset = 0.0 -> position unchanged.
         position=[[x_offset, 0., 0., 0., 0., 0., 1.]],
         showObject=True,
         showObjectScale=0.001,
     )
-    #rigid_base.addObject('UniformMass', name='baseMass', totalMass=0.001)
+    rigid_base.addObject('UniformMass', name='baseMass', totalMass=0.001)
 
     # Motor-held base model: the base remains solver-owned, but every Rigid3d
     # component is pulled to the external control pose. During initialization the
@@ -856,7 +859,7 @@ def add_cosserat_tube(root_node,
             'RestShapeSpringsForceField',
             name='base_control_spring',
             stiffness=stiffness,
-            angularStiffness=1e18,
+            angularStiffness=1e8,
             external_rest_shape=base_control_mo.getLinkPath(),
             external_points=[0],
             mstate='@cosserat_base_mo',
@@ -899,7 +902,7 @@ def add_cosserat_tube(root_node,
         showObject=True,
         showObjectScale=0.001,
     )
-    #frame_node.addObject('UniformMass', name='mass', totalMass=mass)
+    frame_node.addObject('UniformMass', name='mass', totalMass=mass)
     frame_node.addObject(
         'DiscreteCosseratMapping',
         name='cosseratMapping',
@@ -1171,7 +1174,7 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
                  bcm,
                  cpuc,
                  t2_x_offset,
-                 path="ctr_two_tube_spring_driven_diag.csv",
+                 path="ctr_two_tubes_quasi-static.csv",
                  every_n_steps=20,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1215,7 +1218,7 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
             "t2_tip_x,t2_tip_y,t2_tip_z,"
             "contact_pairs,active_like_pairs,min_gap,max_gap,mean_gap,"
             "gap_sign,activation_tolerance,"
-            "active_impulse_pairs,normal_impulse_sum,normal_impulse_max,"
+            "active_lambda_pairs,normal_lambda_sum,normal_lambda_max,"
             "normal_force_sum_N,normal_force_max_N\n"
         )
         print(f"[CTRDiagnosticLogger] writing {self.path}")
@@ -1309,18 +1312,18 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
 
     def _normal_impulse_stats(self, dt):
         try:
-            impulses = [float(x) for x in self.cpuc.normalContactImpulses.value]
+            lambdas = [float(x) for x in self.cpuc.normalContactImpulses.value]
         except Exception:
-            impulses = []
-        if not impulses:
+            lambdas = []
+        if not lambdas:
             return 0, 0.0, 0.0, 0.0, 0.0
 
-        abs_impulses = [abs(x) for x in impulses]
-        impulse_sum = sum(abs_impulses)
-        impulse_max = max(abs_impulses)
-        if dt > 0.0:
-            return len(impulses), impulse_sum, impulse_max, impulse_sum / dt, impulse_max / dt
-        return len(impulses), impulse_sum, impulse_max, 0.0, 0.0
+        abs_lambdas = [abs(x) for x in lambdas]
+        lambda_sum = sum(abs_lambdas)
+        lambda_max = max(abs_lambdas)
+        # firstOrder=True quasi-static solve: the stored lambda is already a
+        # force-like contact reaction in SI units, not an impulse to divide by dt.
+        return len(lambdas), lambda_sum, lambda_max, lambda_sum, lambda_max
 
     def _contact_stats(self):
         try:
@@ -1744,6 +1747,7 @@ def createScene(root_node):
         every_n_steps=20,
         contact_constraint=cpuc,
         force_unit_scale=1.0,  # SI scene units: kg*m/s^2 = N
+        force_conversion='lambda',  # firstOrder=True: lambda is force-like already
     ))
 
     root_node.animate = False

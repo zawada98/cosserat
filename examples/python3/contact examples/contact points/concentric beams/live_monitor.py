@@ -81,6 +81,7 @@ class LiveContactMonitor(Sofa.Core.Controller):
                  constraint_solver=None,       # optional BGS solver for contact forces
                  contact_constraint=None,      # optional CPULC/CPULC2 object
                  force_unit_scale=1.0,         # model force unit -> newtons
+                 force_conversion='auto',      # auto | impulse | lambda
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -93,6 +94,7 @@ class LiveContactMonitor(Sofa.Core.Controller):
         self.constraint_solver = constraint_solver
         self.contact_constraint = contact_constraint
         self.force_unit_scale = float(force_unit_scale)
+        self.force_conversion = str(force_conversion).lower()
 
         # ---- Tunables ----
         # Throttle.  At dt = 1e-4 s and 100 sim-steps / real-second, every=20
@@ -104,6 +106,8 @@ class LiveContactMonitor(Sofa.Core.Controller):
         # ---- Internal state ----
         self._step = 0
         self._force_warning_emitted = False
+        self._force_conversion_warning_emitted = False
+        self._force_conversion_mode = None
         self._empty_reason_counts = {}
 
         # ---- Sanity: contactPoints mode required ----
@@ -276,10 +280,10 @@ class LiveContactMonitor(Sofa.Core.Controller):
 
     def _read_contact_forces(self, valid_k):
         """
-        Return normal contact forces aligned with `valid_k`.
+        Return normal contact reactions aligned with `valid_k`.
 
         Newer ContactPointsUnilateralConstraint variants expose the solved
-        normal impulse together with the original BCM pair index k.  That is
+        normal lambda together with the original BCM pair index k.  That is
         the only exact way to align forces after activation filtering skips
         some geometric pairs.  For older plugin binaries, fall back to the
         previous solver-vector path but only for active rows inferred from the
@@ -323,12 +327,12 @@ class LiveContactMonitor(Sofa.Core.Controller):
             return forces
 
         if raw.size >= count:
-            impulses = raw[:count]
+            lambdas = raw[:count]
         else:
-            impulses = np.full(count, np.nan, dtype=float)
-            impulses[:raw.size] = raw
+            lambdas = np.full(count, np.nan, dtype=float)
+            lambdas[:raw.size] = raw
 
-        forces[active_pos] = self._impulses_to_forces(impulses)
+        forces[active_pos] = self._lambdas_to_contact_forces(lambdas)
         return forces
 
     def _read_indexed_contact_impulses(self, valid_k):
@@ -339,20 +343,20 @@ class LiveContactMonitor(Sofa.Core.Controller):
         try:
             pair_ids = np.asarray(
                 constraint.activeContactPairIndices.value, dtype=int).reshape(-1)
-            impulses = np.asarray(
+            lambdas = np.asarray(
                 constraint.normalContactImpulses.value, dtype=float).reshape(-1)
         except Exception:
             return None
 
-        if pair_ids.size == 0 or impulses.size == 0:
+        if pair_ids.size == 0 or lambdas.size == 0:
             return np.zeros(valid_k.shape, dtype=float)
 
-        n = min(pair_ids.size, impulses.size)
-        by_pair = {int(pair_ids[i]): float(impulses[i]) for i in range(n)}
+        n = min(pair_ids.size, lambdas.size)
+        by_pair = {int(pair_ids[i]): float(lambdas[i]) for i in range(n)}
         out = np.zeros(valid_k.shape, dtype=float)
         for i, k in enumerate(valid_k):
             out[i] = by_pair.get(int(k), 0.0)
-        return self._impulses_to_forces(out)
+        return self._lambdas_to_contact_forces(out)
 
     def _active_mask_from_constraint(self, valid_k):
         """
@@ -377,7 +381,11 @@ class LiveContactMonitor(Sofa.Core.Controller):
 
         return gaps <= activation
 
-    def _impulses_to_forces(self, impulses):
+    def _lambdas_to_contact_forces(self, lambdas):
+        mode = self._resolved_force_conversion_mode()
+        if mode == 'lambda':
+            return lambdas * self.force_unit_scale
+
         dt = 1.0
         try:
             dt = float(self.getContext().getRoot().dt.value)
@@ -388,7 +396,126 @@ class LiveContactMonitor(Sofa.Core.Controller):
                 pass
         if abs(dt) < 1e-20:
             dt = 1.0
-        return (impulses / dt) * self.force_unit_scale
+        return (lambdas / dt) * self.force_unit_scale
+
+    def _resolved_force_conversion_mode(self):
+        """
+        Return how the solved contact lambda should be displayed as force.
+
+        In second-order dynamics the lambda exposed by CPULC2 is impulse-like,
+        so the plotted average force is lambda / dt.  In first-order
+        quasi-static Euler, the same Data field name is misleading: the
+        position correction solve stores a force/reaction-like lambda already,
+        and dividing by dt inflates the display by 1 / dt.
+        """
+        if self.force_conversion in ('impulse', 'impulses', 'lambda_over_dt'):
+            return 'impulse'
+        if self.force_conversion in ('lambda', 'force', 'raw'):
+            return 'lambda'
+        if self.force_conversion != 'auto':
+            if not self._force_conversion_warning_emitted:
+                Sofa.msg_warning(
+                    'LiveContactMonitor',
+                    f"Unknown force_conversion={self.force_conversion!r}; "
+                    "falling back to auto.")
+                self._force_conversion_warning_emitted = True
+
+        if self._force_conversion_mode is None:
+            self._force_conversion_mode = (
+                'lambda' if self._uses_first_order_ode_solver()
+                else 'impulse'
+            )
+        return self._force_conversion_mode
+
+    def _uses_first_order_ode_solver(self):
+        """
+        Best-effort scene inspection.  The contact monitor is often attached
+        outside the tube solver node, so search from root and accept the first
+        ODE solver exposing a firstOrder Data field.  Existing non-first-order
+        scenes keep the historical impulse/dt conversion.
+        """
+        contexts = []
+        for obj in (self.t2_MO, self.contact_mo, self.bcm, self):
+            try:
+                ctx = obj.getContext()
+                if ctx is not None and ctx not in contexts:
+                    contexts.append(ctx)
+            except Exception:
+                pass
+        try:
+            root = self.getContext().getRoot()
+            if root is not None and root not in contexts:
+                contexts.append(root)
+        except Exception:
+            pass
+
+        for ctx in contexts:
+            solver = self._find_object_with_data_in_tree(
+                ctx, ('firstOrder',), ('odesolver', 'EulerImplicitSolver'))
+            if solver is None:
+                continue
+            try:
+                return bool(solver.firstOrder.value)
+            except Exception:
+                try:
+                    return bool(solver.findData('firstOrder').value)
+                except Exception:
+                    continue
+        return False
+
+    @staticmethod
+    def _find_object_with_data_in_tree(node, data_names, preferred_names=()):
+        for name in preferred_names:
+            try:
+                obj = node.getObject(name)
+                if obj is not None:
+                    for data_name in data_names:
+                        try:
+                            if obj.findData(data_name) is not None:
+                                return obj
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                obj = getattr(node, name)
+                if obj is not None:
+                    for data_name in data_names:
+                        try:
+                            if obj.findData(data_name) is not None:
+                                return obj
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        try:
+            objects = list(node.objects)
+        except Exception:
+            objects = []
+        for obj in objects:
+            for data_name in data_names:
+                try:
+                    if obj.findData(data_name) is not None:
+                        return obj
+                except Exception:
+                    pass
+
+        children = []
+        for attr in ('children', 'getChildren'):
+            try:
+                value = getattr(node, attr)
+                children = list(value() if callable(value) else value)
+                break
+            except Exception:
+                pass
+
+        for child in children:
+            found = LiveContactMonitor._find_object_with_data_in_tree(
+                child, data_names, preferred_names)
+            if found is not None:
+                return found
+        return None
 
     def _get_contact_constraint(self):
         if self.contact_constraint is not None:

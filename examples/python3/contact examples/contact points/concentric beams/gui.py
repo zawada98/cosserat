@@ -466,11 +466,10 @@ class CTRGuiBridge:
 
         # ----- Row 0: dt -----
         ttk.Label(dt_frame, text='dt [s]:').grid(row=0, column=0, sticky='w')
-        # The Spinbox starts at init_dt -- the actual dt the simulation is
-        # running at the moment control phase begins.  Showing
-        # default_control_dt here was misleading: the user could click Apply
-        # without changing the value and trigger a silent 10x dt jump that
-        # crashed the solver.
+        # The Spinbox starts at init_dt while the scene is still in the
+        # initialization phase.  When control starts, _poll refreshes it to
+        # default_control_dt, which is the value restored by the scene's
+        # initialization-complete callback.
         self._var_dt = tk.StringVar(value=f"{self._init_dt:.6g}")
         sb = ttk.Spinbox(dt_frame, textvariable=self._var_dt, width=12,
                         from_=self._dt_min, to=self._dt_max,
@@ -749,6 +748,7 @@ class CTRGuiBridge:
             init_complete = self._shared['init_complete']
 
         if init_complete and not self._control_widgets_enabled:
+            self._var_dt.set(f"{self._default_control_dt:.6g}")
             self._set_controls_state(True)
             self._status_label.configure(text='Status: control active')
             self._control_widgets_enabled = True

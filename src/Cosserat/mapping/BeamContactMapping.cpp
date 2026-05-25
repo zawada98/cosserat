@@ -290,43 +290,24 @@ namespace Cosserat
             // ── Centreline points: SSIM snapshot vs. current input frames ──────
             const Vec3 P_A_ssim  = l_ssim->getCenterlinePoint1(k);
             const Vec3 P_B_ssim  = l_ssim->getCenterlinePoint2(k);
-            const Vec3 Pc_A_ssim = l_ssim->getSurfacePoint1(k);
-            const Vec3 Pc_B_ssim = l_ssim->getSurfacePoint2(k);
-
+            const Vec3 Pc_A= l_ssim->getSurfacePoint1(k);
+            const Vec3 Pc_B= l_ssim->getSurfacePoint2(k);
             
-
-            Vec3 P_A_in = frames1[i].getCenter() * (Real(1) - alpha)
-                   + frames1[i + 1].getCenter() *  alpha;
-
-            Vec3 P_B_in = frames2[j].getCenter() * (Real(1) - beta)
-                   + frames2[j + 1].getCenter() *  beta;
-
-
-            // ── Surface points re-based on current input frames ────────────────
-            // (Pc_ssim − P_ssim) is r_eff · n̂ along the frozen normal — invariant
-            // under the kinematic difference between the SSIM snapshot and the
-            // current input. So Pc_A/Pc_B follow the input frames without BCM
-            // needing to know r_eff or contactConfiguration.
-            const Vec3 Pc_A = P_A_in + (Pc_A_ssim - P_A_ssim);   
-            const Vec3 Pc_B = P_B_in + (Pc_B_ssim - P_B_ssim);  
 
             // ── Moment arms (unchanged code; now naturally consistent) ─────────
             // arm = Pc − p_frame. Both terms come from the SAME input frames pass,
             // so the arm is the moment arm in the current input configuration —
             // exactly what applyJ/applyJT(MatrixDeriv) need to be J-consistent.
-            const Vec3 p_i = frames1[i].getCenter();
-            const Vec3 p_j = frames2[j].getCenter();
-
             ContactJacEntry& entry = m_jacCache[k];
             
-            const Vec3 p_ip1 = frames1[i + 1].getCenter();
-            entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - p_i   };
-            entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - p_ip1 };
+
+            entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - P_A_ssim   };
+            entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - P_A_ssim };
 
 
             const Vec3 p_jp1 = frames2[j + 1].getCenter();
-            entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - p_j   };
-            entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - p_jp1 };
+            entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - P_B_ssim   };
+            entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - P_B_ssim };
 
             entry.normal   = n;
             entry.tangent1 = t1;

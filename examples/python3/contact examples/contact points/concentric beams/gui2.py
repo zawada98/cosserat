@@ -591,6 +591,7 @@ class CTRGuiBridgeStraightOuter:
             init_complete = self._shared['init_complete']
 
         if init_complete and not self._control_widgets_enabled:
+            self._var_dt.set(f"{self._default_control_dt:.6g}")
             self._set_controls_state(True)
             self._status_label.configure(text='Status: control active')
             self._control_widgets_enabled = True
