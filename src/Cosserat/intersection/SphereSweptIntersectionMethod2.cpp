@@ -91,6 +91,10 @@ namespace Cosserat {
             "A cached normal is rejected if its projection on either segment tangent "
             "exceeds this value. Default 0.17 ~ sin(10 deg)."))
         // ── Outputs ───────────────────────────────────────────────────────────
+        , d_curvilinearParams(initData(&d_curvilinearParams,
+            "curvilinearParams",
+            "Normalised curvilinear parameters {s1*, s2*} per contact pair. "
+            "Always refers to original beam numbering. "))
     {
         sofa::helper::OptionsGroup cfgOptions({ "external", "nested" }); 
         cfgOptions.setSelectedItem(0u); // default: "external"
@@ -102,15 +106,30 @@ namespace Cosserat {
     // ─────────────────────────────────────────────────────────────────────────────
     void SphereSweptIntersectionMethod::init()
     {
+        addInput(&d_beam1Frames);
+        addInput(&d_beam2Frames);
+        addInput(&d_radius1);
+        addInput(&d_radius2);
+        addInput(&d_innerRadius1);
+        addInput(&d_innerRadius2);
+        addInput(&d_contactConfiguration);
+        addInput(&d_broadPhaseMarginFactor);
+        addInput(&d_defaultNormal);
+        addInput(&d_beam1Velocities);  
+        addInput(&d_beam2Velocities); 
+
+        addOutput(&d_curvilinearParams);
+        
         Inherit1::init();
        	validateParameters();
+        setDirtyValue();
     }
 
     void SphereSweptIntersectionMethod::reinit()
     {
         if (!validateParameters())
             return;
-        m_evalCacheValid = false;
+        update();
     }
     
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,7 +138,7 @@ namespace Cosserat {
 //  Runs every parameter-consistency check. Sets d_componentState to Invalid on
 //  failure and returns false. Clears m_lastValidNormal because cached normals
 //  keyed by (i,j) section-pair indices may be stale after topology changes.
-//  Called by init() and reinit().
+//  Called by init() (after addInput/addOutput) and reinit().
 // ─────────────────────────────────────────────────────────────────────────────
 bool SphereSweptIntersectionMethod::validateParameters()
 {
@@ -285,7 +304,7 @@ bool SphereSweptIntersectionMethod::validateParameters()
 }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    //  evaluateContacts  - main entry point
+    //  doUpdate  – main entry point
     // ─────────────────────────────────────────────────────────────────────────────
     std::ofstream& ssimLog() {
         // Opens once. Path is overridable via the COSSERAT_LOG_DIR env var,
@@ -298,22 +317,37 @@ bool SphereSweptIntersectionMethod::validateParameters()
         return f;
     }
     
-    SphereSweptIntersectionMethod::ContactEvaluation
-    SphereSweptIntersectionMethod::computeContacts(
-        const VecRigidCoord& frames1,
-        const VecRigidCoord& frames2,
-        const VecRigidDeriv& vels1,
-        const VecRigidDeriv& vels2)
-    {
-        ContactEvaluation result;
+    void SphereSweptIntersectionMethod::doUpdate()
+    {   
         // ── Write-accessors for outputs ──────────────────────────────────────────
+        sofa::helper::WriteOnlyAccessor<sofa::Data<sofa::type::vector<sofa::type::Vec2d>>>
+            outParams = d_curvilinearParams;
+        
+        m_distances.clear();         
+        m_centerlinePoints1.clear();  
+        m_centerlinePoints2.clear(); 
+        m_surfacePoints1.clear();     
+        m_surfacePoints2.clear();     
+        m_contactSectionIds.clear();    
+        m_contactNormals.clear();
+        m_contactTangents1.clear();
+        m_contactTangents2.clear();
+
+        outParams.clear();
+        
         if (this->d_componentState.getValue() ==
         sofa::core::objectmodel::ComponentState::Invalid)
         {
-            return result;
+            return;
         }
         
         // ── Read inputs ──────────────────────────────────────────────────────────
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidCoord>> frames1 = d_beam1Frames;
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidCoord>> frames2 = d_beam2Frames;
+        
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidDeriv>> vels1 = d_beam1Velocities;
+        sofa::helper::ReadAccessor<sofa::Data<VecRigidDeriv>> vels2 = d_beam2Velocities;
+
         // dt is needed to convert tangential velocity → tangential displacement.
         const Real dt_sim = static_cast<Real>(getContext()->getDt());
 
@@ -330,7 +364,7 @@ bool SphereSweptIntersectionMethod::validateParameters()
         {
             msg_warning() << "Need at least 2 frames per beam. "
                 "Beam1 has " << N1 << ", Beam2 has " << N2 << ".";
-            return result;
+            return;
         }
 
         // ── Contact configuration ────────────────────────────────────────────────
@@ -367,8 +401,8 @@ bool SphereSweptIntersectionMethod::validateParameters()
         // numbering before being written.
         const bool useSwapped = (N2 > N1);
 
-        const VecRigidCoord& finerFrames   = useSwapped ? frames2 : frames1;
-        const VecRigidCoord& coarserFrames = useSwapped ? frames1 : frames2;
+        const VecRigidCoord& finerFrames   = useSwapped ? frames2.ref() : frames1.ref();
+        const VecRigidCoord& coarserFrames = useSwapped ? frames1.ref() : frames2.ref();
         const Real r_finer   = useSwapped ? r2 : r1; // outer radius of finer-mesh beam
         const Real r_coarser = useSwapped ? r1 : r2; // outer radius of coarser-mesh beam
         const Real ri_finer  = useSwapped ? ri2 : ri1; // inner radius of finer-mesh beam
@@ -521,7 +555,7 @@ bool SphereSweptIntersectionMethod::validateParameters()
             // Compute raw contact normal (always Beam-1 → Beam-2 direction).
             const Vec3 nHat_raw = computeContactNormal(
                 pint1, pint2, idx1, idx2, t1, t2,
-                frames1[idx1], frames1[idx1 + 1], s1_out);
+                frames1.ref()[idx1], frames1.ref()[idx1 + 1], s1_out);
 
             // for nested mode, enforce the outer→inner sign convention
             // for the output normal, regardless of which beam is Beam-1 or Beam-2.
@@ -532,7 +566,7 @@ bool SphereSweptIntersectionMethod::validateParameters()
             // values are already chosen to be consistent with this convention.
             // Previously: no sign flip; output normal was Beam-1→Beam-2 regardless of mode.
             const Vec3 nHat_out = (isNested && !beam1IsOuter) ? -nHat_raw : nHat_raw;
-            result.contactNormals.push_back(nHat_out);
+            m_contactNormals.push_back(nHat_out);
 
             // mapToSurface uses correct contact-relevant radii (r_map1, r_map2)
             // instead of always using the outer radii (r1, r2).
@@ -547,8 +581,8 @@ bool SphereSweptIntersectionMethod::validateParameters()
             Vec3 t1_contact, t2_contact;
             computeContactFrame(t1 /*tau1*/, t2 /*tau2*/, nHat_out, t1_contact, t2_contact);
 
-            result.contactTangents1.push_back(t1_contact);
-            result.contactTangents2.push_back(t2_contact);
+            m_contactTangents1.push_back(t1_contact);
+            m_contactTangents2.push_back(t2_contact);
 
             Real delta_t1 = Real(0);                                             
             Real delta_t2 = Real(0);                                        
@@ -558,10 +592,10 @@ bool SphereSweptIntersectionMethod::validateParameters()
             const int next2 = std::min(idx2 + 1, (int)vels2.size() - 1);
 
             // Frame centres (needed for moment arms r = Pa/Pb − p_frame)  
-            const Vec3 pf1_i    = frames1[idx1].getCenter();
-            const Vec3 pf1_next = frames1[next1].getCenter();
-            const Vec3 pf2_i    = frames2[idx2].getCenter();
-            const Vec3 pf2_next = frames2[next2].getCenter();
+            const Vec3 pf1_i    = frames1.ref()[idx1].getCenter();
+            const Vec3 pf1_next = frames1.ref()[next1].getCenter();
+            const Vec3 pf2_i    = frames2.ref()[idx2].getCenter();
+            const Vec3 pf2_next = frames2.ref()[next2].getCenter();
 
             // Angular velocities of the bounding frames             
             const Vec3 omega1_i    = vels1[idx1].getVOrientation();
@@ -598,67 +632,22 @@ bool SphereSweptIntersectionMethod::validateParameters()
             delta_t1 = (v_rel * t1_contact) * dt_sim;                       
             delta_t2 = (v_rel * t2_contact) * dt_sim;
             
-            result.distances.push_back(Vec3(bestGap, delta_t1, delta_t2));
-            result.centerlinePoints1.push_back(pint1);                       
-            result.centerlinePoints2.push_back(pint2);                      
-            result.surfacePoints1.push_back(psurf1);                        
-            result.surfacePoints2.push_back(psurf2);                       
-            result.contactSectionIds.push_back({ idx1, idx2 });       
+            m_distances.push_back(Vec3(bestGap, delta_t1, delta_t2));
+            m_centerlinePoints1.push_back(pint1);                       
+            m_centerlinePoints2.push_back(pint2);                      
+            m_surfacePoints1.push_back(psurf1);                        
+            m_surfacePoints2.push_back(psurf2);                       
+            m_contactSectionIds.push_back({ idx1, idx2 });       
             
-            result.curvilinearParams.push_back({ s1_out, s2_out });
+            outParams.push_back({ s1_out, s2_out });
         }
-
-        return result;
-    }
-
-    int SphereSweptIntersectionMethod::getEvaluationParametersCounter() const
-    {
-        return d_radius1.getCounter()
-             + d_radius2.getCounter()
-             + d_innerRadius1.getCounter()
-             + d_innerRadius2.getCounter()
-             + d_contactConfiguration.getCounter()
-             + d_broadPhaseMarginFactor.getCounter()
-             + d_defaultNormal.getCounter()
-             + d_cachedNormalMaxAxialProjection.getCounter();
-    }
-
-    SphereSweptIntersectionMethod::ContactEvaluation
-    SphereSweptIntersectionMethod::evaluateContacts(
-        const sofa::Data<VecRigidCoord>& frames1Data,
-        const sofa::Data<VecRigidCoord>& frames2Data,
-        const sofa::Data<VecRigidDeriv>& vels1Data,
-        const sofa::Data<VecRigidDeriv>& vels2Data)
-    {
-        const EvaluationCacheKey key {
-            &frames1Data,
-            &frames2Data,
-            &vels1Data,
-            &vels2Data,
-            frames1Data.getCounter(),
-            frames2Data.getCounter(),
-            vels1Data.getCounter(),
-            vels2Data.getCounter(),
-            getEvaluationParametersCounter()
-        };
-
-        if (m_evalCacheValid && key == m_evalCacheKey)
-            return m_evalCache;
-
-        m_evalCache = computeContacts(frames1Data.getValue(),
-                                      frames2Data.getValue(),
-                                      vels1Data.getValue(),
-                                      vels2Data.getValue());
-        m_evalCacheKey = key;
-        m_evalCacheValid = true;
-        return m_evalCache;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  computeContactNormal
     //
     //  Returns the RAW Beam-1 → Beam-2 contact normal.
-    //  The nested outer→inner sign flip is applied by evaluateContacts() on the output,
+    //  The nested outer→inner sign flip is applied by doUpdate() on the output,
     //  NOT here, so that m_lastValidNormal caches the raw direction and the cache
     //  remains consistent regardless of which beam is outer/inner in the scene.
     //
@@ -799,7 +788,21 @@ SphereSweptIntersectionMethod::computeContactNormal(
 }
 
     // ─────────────────────────────────────────────────────────────────────────────
+    //  getContactNormal – accessor for the k-th output slot normal.
     // ─────────────────────────────────────────────────────────────────────────────
+    SphereSweptIntersectionMethod::Vec3 SphereSweptIntersectionMethod::getContactNormal(std::size_t k) const
+    {   
+        ensureUpdated(); 
+        if (k >= m_contactNormals.size())
+        {
+            msg_error() << "getContactNormal: index " << k
+                        << " is out of range (current contact count = "
+                        << m_contactNormals.size() << "). Aborting.";
+            return Vec3(Real(0), Real(0), Real(1));
+        }
+        return m_contactNormals[k];
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────
     //  mapToSurface
     //  Maps centreline contact points to physical surface contact points using the
@@ -808,7 +811,7 @@ SphereSweptIntersectionMethod::computeContactNormal(
     //    psurf1 = pint1 + r_surf1 * nHat
     //    psurf2 = pint2 − r_surf2 * nHat
     //
-    //  The caller (evaluateContacts) selects r_surf1/r_surf2 based on the contact mode:
+    //  The caller (doUpdate) selects r_surf1/r_surf2 based on the contact mode:
     //    External:            r_surf1=r1,   r_surf2=r2
     //    Nested (beam1=outer):r_surf1=ri1,  r_surf2=r2
     //    Nested (beam1=inner):r_surf1=r1,   r_surf2=ri2
@@ -1100,6 +1103,34 @@ SphereSweptIntersectionMethod::computeContactNormal(
      
  
 
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getContactTangent1(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_contactTangents1.size())
+        {
+            msg_error() << "getContactTangent1(): index " << k
+                        << " out of range (size=" << m_contactTangents1.size()
+                        << "). Returning fallback (1,0,0).";
+            return Vec3(Real(1), Real(0), Real(0));
+        }
+        return m_contactTangents1[k];
+    }
+ 
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getContactTangent2(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_contactTangents2.size())
+        {
+            msg_error() << "getContactTangent2(): index " << k
+                        << " out of range (size=" << m_contactTangents2.size()
+                        << "). Returning fallback (0,1,0).";
+            return Vec3(Real(0), Real(1), Real(0));
+        }
+        return m_contactTangents2[k];
+    }
+    
     SphereSweptIntersectionMethod::Real
     SphereSweptIntersectionMethod::gapSignForPublishedNormal() const
     {
@@ -1111,6 +1142,113 @@ SphereSweptIntersectionMethod::computeContactNormal(
         return beam1IsOuter ? Real(-1) : Real(1);
     }
     
+    std::size_t SphereSweptIntersectionMethod::getNumContacts() const
+    {
+        ensureUpdated();  
+        return m_contactNormals.size();
+    }
+
+    SphereSweptIntersectionMethod::Vec2d
+SphereSweptIntersectionMethod::getCurvilinearParams(std::size_t k) const
+    {
+        ensureUpdated();  
+        const auto& params = d_curvilinearParams.getValue();
+        if (k >= params.size())
+        {
+            msg_error() << "getCurvilinearParams: index " << k
+                        << " out of range (size=" << params.size() << ").";
+            return Vec2d(Real(0), Real(0));
+        }
+        return params[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getDistances(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_distances.size())
+        {
+            msg_error() << "getDistances: index " << k
+                        << " out of range (size=" << m_distances.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_distances[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getCenterlinePoint1(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_centerlinePoints1.size())
+        {
+            msg_error() << "getCenterlinePoint1: index " << k
+                        << " out of range (size=" << m_centerlinePoints1.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_centerlinePoints1[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getCenterlinePoint2(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_centerlinePoints2.size())
+        {
+            msg_error() << "getCenterlinePoint2: index " << k
+                        << " out of range (size=" << m_centerlinePoints2.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_centerlinePoints2[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getSurfacePoint1(std::size_t k) const
+    {
+        ensureUpdated();  
+        if (k >= m_surfacePoints1.size())
+        {
+            msg_error() << "getSurfacePoint1: index " << k
+                        << " out of range (size=" << m_surfacePoints1.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_surfacePoints1[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec3
+    SphereSweptIntersectionMethod::getSurfacePoint2(std::size_t k) const
+    {   
+        ensureUpdated();  
+        if (k >= m_surfacePoints2.size())
+        {
+            msg_error() << "getSurfacePoint2: index " << k
+                        << " out of range (size=" << m_surfacePoints2.size() << ").";
+            return Vec3(Real(0), Real(0), Real(0));
+        }
+        return m_surfacePoints2[k];
+    }
+
+    SphereSweptIntersectionMethod::Vec2i
+    SphereSweptIntersectionMethod::getContactSectionIds(std::size_t k) const
+    {   
+        ensureUpdated();  
+        if (k >= m_contactSectionIds.size())
+        {
+            msg_error() << "getContactSectionIds: index " << k
+                        << " out of range (size=" << m_contactSectionIds.size() << ").";
+            return Vec2i(-1, -1);
+        }
+        return m_contactSectionIds[k];
+    }
+    
+    void SphereSweptIntersectionMethod::ensureUpdated() const
+    {
+        // updateIfDirty() comes from DDGNode (via DataEngine). It is a no-op
+        // if the node is already clean, otherwise it runs doUpdate().
+        // const_cast is the documented SOFA idiom for this pattern: the logical
+        // state (inputs → outputs) is unchanged, only the cached representation
+        // is refreshed.
+        const_cast<SphereSweptIntersectionMethod*>(this)->updateIfDirty();
+    }
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  SOFA factory registration

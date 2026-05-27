@@ -24,7 +24,9 @@ namespace Cosserat
 using sofa::component::constraint::lagrangian::model::UnilateralConstraintResolution;
 using sofa::component::constraint::lagrangian::model::UnilateralConstraintResolutionWithFriction;
     
-    bool traceCpuc()
+    namespace
+    {
+    bool traceCpuc2()
     {
         static const bool enabled = std::getenv("COSSERAT_TRACE_CPUC") != nullptr;
         return enabled;
@@ -37,6 +39,7 @@ using sofa::component::constraint::lagrangian::model::UnilateralConstraintResolu
             return std::ofstream(path, std::ios::out | std::ios::trunc);
         }();
         return f;
+    }
     }
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constructor
@@ -110,7 +113,7 @@ void ContactPointsUnilateralConstraint::reinit()
 {
     init();
 }
-
+    
 // ─────────────────────────────────────────────────────────────────────────────
 //  rebuildContacts
 //
@@ -171,9 +174,23 @@ void ContactPointsUnilateralConstraint::rebuildContacts()
         
         const VecCoord& xMO = this->mstate->read(
         sofa::core::vec_id::read_access::position)->getValue();
-        c.Q = xMO[2 * k];        // Pc_A — Beam-1 surface
-        c.P = xMO[2 * k + 1];    // Pc_B — Beam-2 surface
-        
+        const VecCoord& xfreeMO = this->mstate->read(
+        sofa::core::vec_id::read_access::freePosition)->getValue();
+
+        if (2 * k + 1 >= xfreeMO.size())
+        {
+            msg_error() << "Contact pair " << k
+                        << " requires freePosition slots " << (2 * k)
+                        << " and " << (2 * k + 1)
+                        << " but freePosition size=" << xfreeMO.size()
+                        << ". Registering only pairs [0," << k << ").";
+            break;
+        }
+        c.Q = xMO[2 * k];
+        c.P = xMO[2 * k + 1];
+        c.Qfree = xfreeMO[2 * k];
+        c.Pfree = xfreeMO[2 * k + 1];
+
         const Real delta_k = m_sign * sofa::type::dot(c.P - c.Q, c.n);
         if (delta_k > d_activationTolerance.getValue())
             continue;
@@ -245,9 +262,6 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
     if (!m_constraintRowsBuilt) return;    
     if (m_contacts.empty()) return;
         
-    const VecCoord& xfree     = this->mstate->read(
-                                sofa::core::vec_id::read_access::freePosition)->getValue();
-
     const bool posOrder =
         (cParams->constOrder() == sofa::core::ConstraintOrder::POS ||
          cParams->constOrder() == sofa::core::ConstraintOrder::POS_AND_VEL);
@@ -256,16 +270,10 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
 
     if (posOrder)
     {
-        const VecDeriv& vfree =
-        this->mstate->read(sofa::core::vec_id::read_access::freeVelocity)->getValue();
-        const SReal dt = this->getContext()->getDt();
         for (Contact& con : m_contacts)
         {
-            const int m1 = 2 * con.k;
-            const int m2 = 2 * con.k + 1;
-            
-            const Coord& Pfree = xfree[m2];
-            const Coord& Qfree = xfree[m1];
+            const Coord& Pfree = con.Pfree;
+            const Coord& Qfree = con.Qfree;
             const Coord& P     = con.P;
             const Coord& Q     = con.Q;
 
@@ -273,14 +281,12 @@ void ContactPointsUnilateralConstraint::getConstraintViolation(
             const Coord QQfree = Qfree - Q;
             const Real  ref_dist = PPfree.norm() + QQfree.norm();
             
-            const Real dfree_pred = m_sign * sofa::type::dot(Pfree - Qfree, con.n);
-            const Real delta      = m_sign * sofa::type::dot(P     - Q    , con.n);
-            const Real dfree = std::min(dfree_pred, delta);
-            //const Real dfree = dfree_pred;
-            
+            const Real dfree = m_sign * sofa::type::dot(Pfree - Qfree, con.n);
+            const Real delta = m_sign * sofa::type::dot(P - Q, con.n);
+
             v->set(con.cId, dfree);
             con.dfree_n = dfree;
-            if (traceCpuc())
+            if (traceCpuc2())
             {
                 auto& log = cpucLog();
                 log << "[CPUC-RAW] t=" << this->getContext()->getTime()
@@ -508,7 +514,7 @@ void ContactPointsUnilateralConstraint::draw(
     d_activeContactPairIndices.setValue(pairIds);
     d_normalContactImpulses.setValue(normalImpulses);
 
-    if (!traceCpuc()) return;
+    if (!traceCpuc2()) return;
 
     auto& log = cpucLog();
     for (const Contact& con : m_contacts)
@@ -564,3 +570,5 @@ void registerContactPointsUnilateralConstraint(sofa::core::ObjectFactory* factor
 }
 
 } // namespace Cosserat
+
+

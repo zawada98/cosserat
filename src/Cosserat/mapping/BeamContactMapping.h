@@ -34,10 +34,9 @@
 #include <array>
 #include <string>
 #include <Cosserat/engine/ContactTriad.h>  
+#include <Cosserat/intersection/SphereSweptIntersectionMethod.h>
 
 // Forward declaration – full definition included only in the .cpp.
-namespace Cosserat { class SphereSweptIntersectionMethod; }
-
 namespace sofa { namespace core { class ObjectFactory; } }
 
 namespace Cosserat
@@ -55,9 +54,7 @@ namespace Cosserat
      * Consumes:
      *   In1 – Beam-1 Rigid3d frames (N1 frames, from DiscreteCosseratMapping)
      *   In2 – Beam-2 Rigid3d frames (N2 frames, from DiscreteCosseratMapping)
-     *   d_contactSectionIds  – {i,j}  from SphereSweptIntersectionMethod
-     *   d_curvilinearParams  – {α,β}  from SphereSweptIntersectionMethod
-     *
+     *   SphereSweptIntersectionMethod::ContactEvaluation snapshots.
      * Both modes require exactly ONE connected output MechanicalObject.
      *
      * Output layout depends on d_mappingMode:
@@ -79,7 +76,7 @@ namespace Cosserat
      *       (to be fair, in δ_n the formula might be = (Pc_A − Pc_B) · n̂ 
      *       basically, it is the case when the two beams are nested and beam 2
      *       inner one, i.e. Pc_B is on inner tube).
-     *     Contact-local frame basis (identical to SSIM d_distances convention):  
+     *     Contact-local frame basis (identical to SSIM ContactEvaluation distances):  
      *       n̂   – unit contact normal from SSIM (Beam-1 → Beam-2 for external;
      *              outer → inner for nested CTR)
      *       t̂₁  – normalize(τ₁ − (τ₁·n̂)·n̂), τ₁ = Beam-1 segment axial chord
@@ -153,7 +150,7 @@ namespace Cosserat
         ///   (to be fair, in δ_n the formula might be = (Pc_A − Pc_B) · n̂ 
         ///   basically, it is the case when the two beams are nested and beam 2 
         ///   inner one, i.e. Pc_B is on inner tube).
-        ///   Contact frame matches SSIM d_distances convention (see class doc).
+        ///   Contact frame matches SSIM ContactEvaluation distances (see class doc).
         ///   applyJT(MatrixDeriv): converts Vec3(d_n, d_t1, d_t2) → d_phys = n̂·d_n + t̂₁·d_t1 + t̂₂·d_t2.
         ///   applyJT(VecDeriv):    converts Vec3(F_n, F_t1, F_t2) → F_phys = n̂·F_n + t̂₁·F_t1 + t̂₂·F_t2.
         sofa::core::objectmodel::Data<std::string>                d_mappingMode;
@@ -175,7 +172,7 @@ namespace Cosserat
         sofa::core::objectmodel::Data<VecVec3>  d_distances;       
         
         /// Mandatory link to the SphereSweptIntersectionMethod that owns contact
-        /// normals. Normals are fetched via l_ssim->getContactNormal(k) and are
+        /// contact evaluations. Normals are read from the cached SSIM ContactEvaluation and are
         /// NEVER recomputed locally in BCM.
         ///
         /// In gap mode BCM also injects the normal into applyJT (both overloads)
@@ -266,18 +263,21 @@ namespace Cosserat
 
             sofa::type::fixed_array<JacBlock, 2> beam2Blocks;
 
+            Vec3 surfacePoint1{ Vec3(0,0,0) };
+            Vec3 surfacePoint2{ Vec3(0,0,0) };
+
             // contact normal fetched from SSIM and frozen at apply() time.
             // Used by applyJ and applyJT to project gap velocities / forces onto n.
             // In contactPoints mode this field is unused (direction comes from ULC).
             Vec3 normal{ Vec3(0,0,1) };
             
             /// Contact-plane axial tangent t̂₁ (projected Beam-1 segment chord ⊥ n̂). 
-            /// Identical to the t1_contact basis vector used by SSIM for d_distances[1].
+            /// Identical to the t1 basis vector used by SSIM for distances[1].
             /// Formula: normalize(τ₁ − (τ₁·n̂)·n̂),  τ₁ = unit chord of Beam-1 segment [i, i+1].
             Vec3 tangent1{ Vec3(Real(1), Real(0), Real(0)) };
  
             /// Contact-plane circumferential tangent t̂₂ = n̂ × t̂₁.             
-            /// Identical to the t2_contact basis vector used by SSIM for d_distances[2].
+            /// Identical to the t2 basis vector used by SSIM for distances[2].
             Vec3 tangent2{ Vec3(Real(0), Real(1), Real(0)) };
             
             Real gapNormal   { Real(0) };   
@@ -285,12 +285,69 @@ namespace Cosserat
             Real gapTangent2 { Real(0) };  
         };
 
-        /// Rebuilt every apply() call; consumed by applyJ / applyJT.
+        
         sofa::type::vector<ContactJacEntry> m_jacCache;
+
+        struct EvaluationCacheKey
+        {
+            const SphereSweptIntersectionMethod* ssim { nullptr };
+            int ssimParameterCounter { 0 };
+            const sofa::core::objectmodel::BaseData* frames1 { nullptr };
+            const sofa::core::objectmodel::BaseData* frames2 { nullptr };
+            const sofa::core::objectmodel::BaseData* vels1 { nullptr };
+            const sofa::core::objectmodel::BaseData* vels2 { nullptr };
+            int frames1Counter { 0 };
+            int frames2Counter { 0 };
+            int vels1Counter { 0 };
+            int vels2Counter { 0 };
+
+            bool operator==(const EvaluationCacheKey& other) const
+            {
+                return ssim == other.ssim &&
+                       ssimParameterCounter == other.ssimParameterCounter &&
+                       frames1 == other.frames1 &&
+                       frames2 == other.frames2 &&
+                       vels1 == other.vels1 &&
+                       vels2 == other.vels2 &&
+                       frames1Counter == other.frames1Counter &&
+                       frames2Counter == other.frames2Counter &&
+                       vels1Counter == other.vels1Counter &&
+                       vels2Counter == other.vels2Counter;
+            }
+        };
+
+        bool m_jacCacheValid { false };
+        EvaluationCacheKey m_jacCacheKey;
 
         bool isGapMode() const { return d_mappingMode.getValue() == "gap"; }
 
-        static constexpr Real s_eps = Real(1e-14);
+        EvaluationCacheKey makeEvaluationCacheKey(
+            const sofa::core::objectmodel::BaseData& frames1Data,
+            const sofa::core::objectmodel::BaseData& frames2Data,
+            const sofa::core::objectmodel::BaseData& vels1Data,
+            const sofa::core::objectmodel::BaseData& vels2Data) const;
+        bool isJacobianCacheValidFor(const EvaluationCacheKey& key) const;
+        void markJacobianCacheValidFor(const EvaluationCacheKey& key);
+
+        bool buildJacobianEntries(const SphereSweptIntersectionMethod::ContactEvaluation& eval,
+                                  const In1VecCoord& frames1,
+                                  const In2VecCoord& frames2,
+                                  sofa::type::vector<ContactJacEntry>& entries,
+                                  const char* caller) const;
+        bool rebuildJacobianCache(const SphereSweptIntersectionMethod::ContactEvaluation& eval,
+                                  const In1VecCoord& frames1,
+                                  const In2VecCoord& frames2);
+        bool rebuildJacobianCacheForApplyJ(
+            const sofa::core::MechanicalParams* mparams,
+            const sofa::core::objectmodel::Data<In1VecDeriv>& vel1Data,
+            const sofa::core::objectmodel::Data<In2VecDeriv>& vel2Data,
+            sofa::type::vector<ContactJacEntry>& scratchCache,
+            const sofa::type::vector<ContactJacEntry>*& jacCacheForApplyJ,
+            Real& gapSignForApplyJ);
+        bool requireFrozenJacobianCache(const char* caller) const;
+        void publishContactDataFromCache();
+
+        static constexpr Real s_invalidGap = Real(1e9);
     };
 
     void registerBeamContactMapping(sofa::core::ObjectFactory* factory);

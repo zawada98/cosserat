@@ -12,7 +12,7 @@
  ******************************************************************************/
 #pragma once
 
-#include <sofa/core/DataEngine.h>
+#include <Cosserat/config.h>
 #include <sofa/core/objectmodel/BaseObject.h>
 #include <sofa/defaulttype/RigidTypes.h>
 #include <sofa/type/Vec.h>
@@ -28,12 +28,10 @@ namespace Cosserat
 	/**
 	* @brief SphereSweptIntersectionMethod (SSIM)
 	*
-	* DataEngine that, at every simulation step, computes the minimum centreline
-	* distance and the contact geometry for every section pair of two Cosserat
-	* beams, treating each beam as a sphere-swept (canal) surface. Consumers
-	* (e.g. BeamContactMapping) read the results through C++ getters or — for the
-	* curvilinear parameters only — through a SOFA Data link.
-	*
+	* BaseObject service used by BeamContactMapping to compute the minimum centreline
+	* distance and contact geometry for every section pair of two Cosserat beams.
+	* Consumers explicitly request ContactEvaluation snapshots through evaluateContacts();
+	* SSIM does not publish per-contact SOFA Data.
 	* ─── Data inputs ────────────────────────────────────────────────────────
 	*   beam1Frames, beam2Frames                     Rigid3d frames (FramesMO output
 	*                                                of DiscreteCosseratMapping)
@@ -59,27 +57,8 @@ namespace Cosserat
 	*                                                rotated more than this
 	*                                                (default π/18 = 10°).
 	*
-	* ─── Outputs ────────────────────────────────────────────────────────────
-	* Only one quantity is exposed as a SOFA Data field:
-	*   curvilinearParams                            vector<Vec2d> of {s1*, s2*},
-	*                                                one pair per contact, in
-	*                                                ORIGINAL beam numbering. 
-	*
-	* Everything else is accessible only through C++ getters (typed for one
-	* contact index k ∈ [0, getNumContacts())):
-	*   getDistances(k)         → Vec3(δn, δt1, δt2). δn is SSIM's signed
-	*                             clearance (positive = clear, negative =
-	*                             penetration). δt1, δt2 are velocity-integrated
-	*                             tangential slip over the current dt (see below).
-	*   getCenterlinePoint1/2(k) → Pa, Pb (closest points on each centreline).
-	*   getSurfacePoint1/2(k)    → Pc_A, Pc_B on the physical surfaces.
-	*   getContactNormal(k)      → published unit normal n̂_out (see convention
-	*                             below).
-	*   getContactTangent1/2(k)  → contact-plane tangents t̂1, t̂2 derived from
-	*                             n̂_out and the Beam-1 segment chord.
-	*   getContactSectionIds(k)  → {i, j} section indices in original numbering.
-	*   gapSignForPublishedNormal() → ±1; see "Gap sign" below.
-	*
+	* evaluateContacts() returns distances, centreline/surface points,
+	* section ids, contact triads, and curvilinear parameters for all contact pairs.
 	* ─── Gap equations ──────────────────────────────────────────────────────
 	*   External (both beams solid, side-by-side):
 	*       δn = dist − (r1 + r2)
@@ -90,7 +69,7 @@ namespace Cosserat
 	*
 	* ─── Contact normal convention ──────────────────────────────────────────
 	*   computeContactNormal() internally produces n̂_raw = (Pb − Pa) / ‖·‖,
-	*   i.e. Beam-1 → Beam-2. doUpdate() then publishes n̂_out:
+	*   i.e. Beam-1 → Beam-2. evaluateContacts() then publishes n̂_out:
 	*       external:             n̂_out = n̂_raw
 	*       nested, Beam1 outer:  n̂_out = n̂_raw           (outer → inner)
 	*       nested, Beam1 inner:  n̂_out = −n̂_raw          (outer → inner)
@@ -146,10 +125,10 @@ namespace Cosserat
     *       broadPhaseMarginFactor = 1.5)
     */	
 		
-    class SphereSweptIntersectionMethod : public sofa::core::DataEngine
+    class SOFA_COSSERAT_API SphereSweptIntersectionMethod : public sofa::core::objectmodel::BaseObject
     {
     public:
-        SOFA_CLASS(SphereSweptIntersectionMethod, sofa::core::DataEngine);
+        SOFA_CLASS(SphereSweptIntersectionMethod, sofa::core::objectmodel::BaseObject);
 
         // ── Type aliases ─────────────────────────────────────────────────────────
         using Rigid3dTypes  = sofa::defaulttype::Rigid3dTypes;
@@ -163,7 +142,22 @@ namespace Cosserat
         using VecReal       = sofa::type::vector<Real>;
         using Vec2i         = sofa::type::Vec<2, int>;
         using VecVec2i      = sofa::type::vector<Vec2i>;
-		using Vec2d         = sofa::type::Vec2d;  
+		using Vec2d         = sofa::type::Vec2d;
+        using VecVec2d      = sofa::type::vector<Vec2d>;
+
+        struct ContactEvaluation
+        {
+            VecVec3  distances;
+            VecVec3  centerlinePoints1;
+            VecVec3  centerlinePoints2;
+            VecVec3  surfacePoints1;
+            VecVec3  surfacePoints2;
+            VecVec2i contactSectionIds;
+            VecVec3  contactNormals;
+            VecVec3  contactTangents1;
+            VecVec3  contactTangents2;
+            VecVec2d curvilinearParams;
+        };
 
         // ── Inputs ───────────────────────────────────────────────────────────────
 
@@ -208,12 +202,6 @@ namespace Cosserat
         /// Default 1.5 catches all segments within 1.5 tube-radii of touching.
         sofa::Data<Real>          d_broadPhaseMarginFactor;
 
-        // ── Outputs ──────────────────────────────────────────────────────────────
-
-        /// Normalised curvilinear parameters {s1*, s2*} per contact pair.
-        /// Always refers to the original beam numbering regardless of which beam
-        /// drove the outer loop. 
-        sofa::Data<sofa::type::vector<sofa::type::Vec2d>> d_curvilinearParams;
 
         /// Default contact normal used when centrelines are coincident AND no previous
         /// valid normal exists AND tangent cross-product is zero (parallel beams).
@@ -236,74 +224,25 @@ namespace Cosserat
 
         void init()     override;
         void reinit()   override;
-        void doUpdate() override;
 
         // ── Public API for external C++ components (e.g. BeamContactMapping) ─────
-		
-		/// Number of contact pairs produced by the most recent doUpdate() call.
-        /// All per-pair getters accept k ∈ [0, getNumContacts()).
-        std::size_t getNumContacts() const;      
-
-		/// {s1*, s2*} curvilinear parameters for contact pair k.
-        /// Always in original beam numbering.
-        Vec2d getCurvilinearParams(std::size_t k) const; 
-
-		/// {δn, δt1, δt2} signed gap vector in contact-local frame {n̂, t̂₁, t̂₂}.
-        Vec3  getDistances(std::size_t k) const;
-
-		 /// Closest point on Beam-1 centreline for contact pair k (Pa).
-        Vec3  getCenterlinePoint1(std::size_t k) const;                          
-        /// Closest point on Beam-2 centreline for contact pair k (Pb).
-        Vec3  getCenterlinePoint2(std::size_t k) const;                           
-
-        /// Physical contact point on Beam-1 surface (Pa + r_surf1 * n̂).
-        Vec3  getSurfacePoint1(std::size_t k) const;                               
-        /// Physical contact point on Beam-2 surface (Pb − r_surf2 * n̂).
-        Vec3  getSurfacePoint2(std::size_t k) const;                            
-
-        /// Beam-section index pair {i_beam1, j_beam2} for contact pair k.
-        Vec2i getContactSectionIds(std::size_t k) const;  
-
-        /**
-         * @brief Returns the contact normal n̂ for contact output slot k, as stored
-         *        from the most recent doUpdate() call.
-         *
-         * Call after doUpdate() has been triggered (e.g. from
-         * BeamContactMapping::apply(), which is called after DataEngine propagation).
-         * Returns a safe fallback (0,0,1) and emits msg_error if k is out of range.
-         */
-        Vec3 getContactNormal(std::size_t k) const;
-        
-        /**
-         * @brief Returns the contact-plane axial tangent t̂₁ for slot k. 
-         *
-         * t̂₁ = normalize(τ₁ − (τ₁·n̂)·n̂),  τ₁ = Beam-1 segment chord.
-         * Consistent with the d_distances[1] and d_contactTangent1 Data output.
-         * Returns fallback (1,0,0) and emits msg_error if k is out of range.
-         */
-        Vec3 getContactTangent1(std::size_t k) const;
- 
-        /**
-         * @brief Returns the contact-plane circumferential tangent t̂₂ = n̂ × t̂₁
-         *        for slot k.                                            
-         *
-         * Consistent with the d_distances[2] and d_contactTangent2 Data output.
-         * Returns fallback (0,1,0) and emits msg_error if k is out of range.
-         */
-        Vec3 getContactTangent2(std::size_t k) const;
- 
+        ContactEvaluation evaluateContacts(const sofa::Data<VecRigidCoord>& frames1Data,
+                                           const sofa::Data<VecRigidCoord>& frames2Data,
+                                           const sofa::Data<VecRigidDeriv>& vels1Data,
+                                           const sofa::Data<VecRigidDeriv>& vels2Data);
+        int getEvaluationParametersCounter() const;
         /**
          * @brief Computes and returns the contact normal n̂ for a given pair of
          *        centreline contact points, updating m_lastValidNormal[(i,j)] as a
          *        side effect.
          *
          * This is the canonical normal-computation entry point. It is called
-         * internally by doUpdate() and can also be called from BeamContactMapping
+         * internally by evaluateContacts() and can also be called from BeamContactMapping
          * (via a pointer to this SSIM object) if the mapping needs to recompute
-         * the normal outside of the DataEngine update cycle.
+         * the normal outside of the last published evaluation.
          *
          * Returns the RAW Beam-1 → Beam-2 direction (before any nested sign flip).
-         * The sign flip to enforce outer→inner convention is applied by doUpdate()
+         * The sign flip to enforce outer→inner convention is applied by evaluateContacts()
          * on the output, not inside this function.
          *
          * @param pint1       Closest point on Beam 1 centreline
@@ -327,16 +266,7 @@ namespace Cosserat
                                   const RigidCoord& frameB,
                                   Real              s1);
 
-		/**
-         * @brief Force the internal m_* arrays to reflect the current inputs.
-         *
-         * Triggers doUpdate() if the DDGNode is dirty. 
-         * const-safe: only mutates members written by doUpdate() (the m_* arrays
-         * and the dirty flag), which are conceptually mutable output state.
-         */
-         void ensureUpdated() const;
-
-		/**
+        /**
          * @brief Returns the sign factor that converts SSIM's published
          *        signed-clearance gap (d_distances[k][0] = bestGap, positive = clear)
          *        into the convention  δ_n = (Pc_B − Pc_A) · nHat_out.
@@ -495,7 +425,7 @@ namespace Cosserat
         * @brief Computes the contact-plane tangent frame {t̂₁, t̂₂} from a raw
         *        axial chord τ and the contact normal n̂.
         *
-        * Algorithm (identical to SSIM doUpdate() inline computation):
+        * Algorithm (identical to SSIM evaluateContacts() inline computation):
         *   t̂₁ = normalize(τ − (τ·n̂)·n̂)      [project onto contact plane]
         *   t̂₂ = n̂ × t̂₁
         *
@@ -530,6 +460,32 @@ namespace Cosserat
     private:
         static constexpr Real s_eps = Real(1e-14); ///< numerical zero
 
+        struct EvaluationCacheKey
+        {
+            const sofa::core::objectmodel::BaseData* frames1 { nullptr };
+            const sofa::core::objectmodel::BaseData* frames2 { nullptr };
+            const sofa::core::objectmodel::BaseData* vels1 { nullptr };
+            const sofa::core::objectmodel::BaseData* vels2 { nullptr };
+            int frames1Counter { 0 };
+            int frames2Counter { 0 };
+            int vels1Counter { 0 };
+            int vels2Counter { 0 };
+            int parameterCounter { 0 };
+
+            bool operator==(const EvaluationCacheKey& other) const
+            {
+                return frames1 == other.frames1 &&
+                       frames2 == other.frames2 &&
+                       vels1 == other.vels1 &&
+                       vels2 == other.vels2 &&
+                       frames1Counter == other.frames1Counter &&
+                       frames2Counter == other.frames2Counter &&
+                       vels1Counter == other.vels1Counter &&
+                       vels2Counter == other.vels2Counter &&
+                       parameterCounter == other.parameterCounter;
+            }
+        };
+
         /// Snapshot stored alongside each cached normal. Enables smoothness-based     
         /// validation of fallback 2a in computeContactNormal().
         /// Previously: cache stored only the Vec3 normal.
@@ -543,24 +499,15 @@ namespace Cosserat
         /// for each section pair (i_beam1, j_beam2). Used for the zero-normal fallback.
         std::map<std::pair<int,int>, CachedNormal> m_lastValidNormal;    
 
-        sofa::type::vector<Vec3>  m_distances;            
-        sofa::type::vector<Vec3>  m_centerlinePoints1;  
-        sofa::type::vector<Vec3>  m_centerlinePoints2;   
-        sofa::type::vector<Vec3>  m_surfacePoints1;       
-        sofa::type::vector<Vec3>  m_surfacePoints2;      
-        sofa::type::vector<Vec2i> m_contactSectionIds;          
 
-        /// Contact normals computed in the most recent doUpdate(), one per output slot.
-        /// Indexed consistently with all other output vectors.
-        /// For nested mode, these are always outer→inner (sign-corrected).
-        /// Exposed via getContactNormal(k) for C++ callers.
-        sofa::type::vector<Vec3> m_contactNormals;
-        
-        /// Contact-plane tangent t̂₁ per output slot, stored from doUpdate().  
-        sofa::type::vector<Vec3> m_contactTangents1;
- 
-        /// Contact-plane tangent t̂₂ per output slot, stored from doUpdate(). 
-        sofa::type::vector<Vec3> m_contactTangents2;
+        ContactEvaluation computeContacts(const VecRigidCoord& frames1,
+                                          const VecRigidCoord& frames2,
+                                          const VecRigidDeriv& vels1,
+                                          const VecRigidDeriv& vels2);
+
+        bool m_evalCacheValid { false };
+        EvaluationCacheKey m_evalCacheKey;
+        ContactEvaluation m_evalCache;
     };
 
 } // namespace Cosserat

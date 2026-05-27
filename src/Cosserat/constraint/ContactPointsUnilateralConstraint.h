@@ -98,6 +98,7 @@ public:
     /// collision pipeline. Default: 1e-3 (1 mm). Should be ≥ the
     /// maximum single-step free-motion displacement of either body.
     sofa::core::objectmodel::Data<Real> d_activationTolerance;
+    
 
     /// BCM pair indices for contacts that built constraint rows last step.
     /// Aligned one-to-one with d_normalContactImpulses.
@@ -152,6 +153,8 @@ private:
         int          k;       ///< pair index in SSIM/BCM outputs
         Coord        P;       ///< Pc_B snapshot taken at buildConstraintMatrix time
         Coord        Q;       ///< Pc_A snapshot taken at buildConstraintMatrix time
+        Coord        Pfree;
+        Coord        Qfree;
         Vec3         n;       ///< n̂[k]   
         Vec3         t1;       ///< t̂₁[k]   (valid only when μ > 0)
         Vec3         t2;       ///< t̂₂[k]   (valid only when μ > 0)

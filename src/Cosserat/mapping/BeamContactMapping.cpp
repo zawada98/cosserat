@@ -40,26 +40,18 @@ namespace sofa::core
 
 namespace Cosserat
 {
-    namespace
-    {
-        bool traceBeamContactMapping()
-        {
-            static const bool enabled = std::getenv("COSSERAT_TRACE_BCM") != nullptr;
-            return enabled;
-        }
 
-        std::ofstream& bcmGapTraceLog()
-        {
-            static std::ofstream f("bcm_gap_trace_log.txt", std::ios::out | std::ios::trunc);
-            return f;
-        }
+    bool traceBeamContactMapping()
+    {
+        static const bool enabled = std::getenv("COSSERAT_TRACE_BCM") != nullptr;
+        return enabled;
     }
 
     BeamContactMapping::BeamContactMapping()
         : Inherit1()
         , l_ssim(initLink("ssim",
                 "Mandatory link to the SphereSweptIntersectionMethod that provides "
-                "contact normals via getContactNormal(k). "
+                "contact evaluations via evaluateContacts(). "
                 "Set via the 'ssim' attribute in the SOFA scene, e.g.: "
                 "ssim='@contact_node/ssim'."))
         , d_mappingMode(
@@ -71,7 +63,7 @@ namespace Cosserat
                "      delta_n  = (Pc_B - Pc_A).n  (signed normal gap, <0 = penetration).\n"
                "      delta_t1 = (Pc_B - Pc_A).t1 (axial tangential gap).\n"
                "      delta_t2 = (Pc_B - Pc_A).t2 (circumferential tangential gap).\n"
-               "    Contact frame {n, t1, t2} matches SSIM d_distances convention:\n"
+               "    Contact frame {n, t1, t2} matches SSIM ContactEvaluation distances:\n"
                "      t1 = normalize(tau1 - (tau1.n)*n), tau1 = Beam-1 segment chord.\n"
                "      t2 = n x t1.\n"
                "    applyJ  gives gap velocity Vec3(dPrel.n, dPrel.t1, dPrel.t2).\n"
@@ -100,7 +92,7 @@ namespace Cosserat
         , d_distances(initData(&d_distances,
             "distances",
             "Consolidated gap Vec3(δn, δt1, δt2)[k] written by apply().\n"
-            "δt1/δt2 come from SSIM::d_distances[k][1,2] (velocity-integrated).\n"
+            "δt1/δt2 come from SSIM ContactEvaluation distances[k][1,2] (velocity-integrated).\n"
             "Link DUCL/CPULC to this field instead of to SSIM."))
     {
     }
@@ -110,7 +102,7 @@ namespace Cosserat
     // ─────────────────────────────────────────────────────────────────────────────
     void BeamContactMapping::init()
     {
-        // Modified – validate SSIM link before anything else.
+        // Validate SSIM link before anything else.
         if (!l_ssim.get())
         {
             msg_error() << "The 'ssim' link is not set. "
@@ -142,6 +134,244 @@ namespace Cosserat
         Inherit1::reinit();
     }
 
+    BeamContactMapping::EvaluationCacheKey BeamContactMapping::makeEvaluationCacheKey(
+        const sofa::core::objectmodel::BaseData& frames1Data,
+        const sofa::core::objectmodel::BaseData& frames2Data,
+        const sofa::core::objectmodel::BaseData& vels1Data,
+        const sofa::core::objectmodel::BaseData& vels2Data) const
+    {
+        EvaluationCacheKey key;
+        key.ssim = l_ssim.get();
+        key.ssimParameterCounter = l_ssim.get() ? l_ssim->getEvaluationParametersCounter() : 0;
+        key.frames1 = &frames1Data;
+        key.frames2 = &frames2Data;
+        key.vels1 = &vels1Data;
+        key.vels2 = &vels2Data;
+        key.frames1Counter = frames1Data.getCounter();
+        key.frames2Counter = frames2Data.getCounter();
+        key.vels1Counter = vels1Data.getCounter();
+        key.vels2Counter = vels2Data.getCounter();
+        return key;
+    }
+
+    bool BeamContactMapping::isJacobianCacheValidFor(const EvaluationCacheKey& key) const
+    {
+        return m_jacCacheValid && key == m_jacCacheKey;
+    }
+
+    void BeamContactMapping::markJacobianCacheValidFor(const EvaluationCacheKey& key)
+    {
+        m_jacCacheKey = key;
+        m_jacCacheValid = true;
+    }
+
+    bool BeamContactMapping::buildJacobianEntries(
+        const SphereSweptIntersectionMethod::ContactEvaluation& eval,
+        const In1VecCoord& frames1,
+        const In2VecCoord& frames2,
+        sofa::type::vector<ContactJacEntry>& entries,
+        const char* caller) const
+    {
+        if (!l_ssim.get())
+        {
+            msg_error() << caller << "(): l_ssim is null. "
+                           "Check that ssim='@...' is set in the scene.";
+            entries.clear();
+            return false;
+        }
+
+        const sofa::Size K = static_cast<sofa::Size>(eval.contactSectionIds.size());
+        if (eval.curvilinearParams.size() < K ||
+            eval.surfacePoints1.size() < K ||
+            eval.surfacePoints2.size() < K ||
+            eval.centerlinePoints1.size() < K ||
+            eval.centerlinePoints2.size() < K ||
+            eval.contactNormals.size() < K ||
+            eval.contactTangents1.size() < K ||
+            eval.contactTangents2.size() < K ||
+            eval.distances.size() < K)
+        {
+            msg_error() << caller << "(): incomplete SSIM evaluation.";
+            entries.clear();
+            return false;
+        }
+        entries.resize(K);
+
+        const int N1 = static_cast<int>(frames1.size());
+        const int N2 = static_cast<int>(frames2.size());
+
+        for (sofa::Size k = 0; k < K; ++k)
+        {
+            ContactJacEntry& entry = entries[k];
+
+            const Vec2i sec = eval.contactSectionIds[k];
+            const int   i   = sec[0];
+            const int   j   = sec[1];
+            const Vec2d cp  = eval.curvilinearParams[k];
+            const Real  alpha = cp[0];
+            const Real  beta  = cp[1];
+
+            if (i < 0 || i + 1 >= N1 || j < 0 || j + 1 >= N2)
+            {
+                msg_error() << "Contact pair " << k << ": section index out of range "
+                    << "(i=" << i << " j=" << j
+                    << " N1=" << N1 << " N2=" << N2 << "). Skipping.";
+
+                entry.normal   = Vec3(Real(0), Real(0), Real(0));
+                entry.tangent1 = Vec3(Real(0), Real(0), Real(0));
+                entry.tangent2 = Vec3(Real(0), Real(0), Real(0));
+                entry.surfacePoint1 = Vec3(Real(0), Real(0), Real(0));
+                entry.surfacePoint2 = Vec3(Real(0), Real(0), Real(0));
+                entry.gapNormal   = s_invalidGap;
+                entry.gapTangent1 = Real(0);
+                entry.gapTangent2 = Real(0);
+                continue;
+            }
+
+            const Vec3 Pc_A = eval.surfacePoints1[k];
+            const Vec3 Pc_B = eval.surfacePoints2[k];
+            const Vec3 P_A_ssim = eval.centerlinePoints1[k];
+            const Vec3 P_B_ssim = eval.centerlinePoints2[k];
+
+            entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - P_A_ssim };
+            entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - P_A_ssim };
+            entry.beam2Blocks[0] = { j,     Real(1) - beta,  Pc_B - P_B_ssim };
+            entry.beam2Blocks[1] = { j + 1, beta,            Pc_B - P_B_ssim };
+
+            entry.surfacePoint1 = Pc_A;
+            entry.surfacePoint2 = Pc_B;
+            entry.normal        = eval.contactNormals[k];
+            entry.tangent1      = eval.contactTangents1[k];
+            entry.tangent2      = eval.contactTangents2[k];
+
+            const Vec3 d = eval.distances[k];
+            entry.gapNormal   = d[0];
+            entry.gapTangent1 = d[1];
+            entry.gapTangent2 = d[2];
+        }
+
+        return true;
+    }
+
+    bool BeamContactMapping::rebuildJacobianCache(
+        const SphereSweptIntersectionMethod::ContactEvaluation& eval,
+        const In1VecCoord& frames1,
+        const In2VecCoord& frames2)
+    {
+        sofa::type::vector<ContactJacEntry> entries;
+        if (!buildJacobianEntries(eval, frames1, frames2, entries, "rebuildJacobianCache"))
+        {
+            m_jacCache.clear();
+            m_jacCacheValid = false;
+            return false;
+        }
+
+        m_jacCache = entries;
+        d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
+        publishContactDataFromCache();
+        return true;
+    }
+
+    bool BeamContactMapping::rebuildJacobianCacheForApplyJ(
+        const sofa::core::MechanicalParams* mparams,
+        const sofa::core::objectmodel::Data<In1VecDeriv>& vel1Data,
+        const sofa::core::objectmodel::Data<In2VecDeriv>& vel2Data,
+        sofa::type::vector<ContactJacEntry>& scratchCache,
+        const sofa::type::vector<ContactJacEntry>*& jacCacheForApplyJ,
+        Real& gapSignForApplyJ)
+    {
+        jacCacheForApplyJ = nullptr;
+        scratchCache.clear();
+        gapSignForApplyJ = d_gapSign.getValue();
+
+        if (!l_ssim.get())
+        {
+            msg_error() << "rebuildJacobianCacheForApplyJ(): l_ssim is null.";
+            return false;
+        }
+
+        const auto& from1 = this->getFromModels1();
+        const auto& from2 = this->getFromModels2();
+        if (from1.empty() || from2.empty() || !from1[0] || !from2[0])
+        {
+            msg_error() << "rebuildJacobianCacheForApplyJ(): missing input MechanicalState.";
+            return false;
+        }
+
+        const auto* frames1Data = mparams
+            ? from1[0]->read(mparams->x().getId(from1[0]))
+            : nullptr;
+        const auto* frames2Data = mparams
+            ? from2[0]->read(mparams->x().getId(from2[0]))
+            : nullptr;
+        if (!frames1Data)
+            frames1Data = from1[0]->read(sofa::core::vec_id::read_access::position);
+        if (!frames2Data)
+            frames2Data = from2[0]->read(sofa::core::vec_id::read_access::position);
+        if (!frames1Data || !frames2Data)
+        {
+            msg_error() << "rebuildJacobianCacheForApplyJ(): could not read input positions.";
+            return false;
+        }
+
+        const EvaluationCacheKey key =
+            makeEvaluationCacheKey(*frames1Data, *frames2Data, vel1Data, vel2Data);
+        if (isJacobianCacheValidFor(key))
+        {
+            jacCacheForApplyJ = &m_jacCache;
+            gapSignForApplyJ = d_gapSign.getValue();
+            return true;
+        }
+
+        const auto eval = l_ssim->evaluateContacts(
+            *frames1Data, *frames2Data, vel1Data, vel2Data);
+        if (!buildJacobianEntries(eval,
+                                  frames1Data->getValue(),
+                                  frames2Data->getValue(),
+                                  scratchCache,
+                                  "rebuildJacobianCacheForApplyJ"))
+        {
+            return false;
+        }
+
+        jacCacheForApplyJ = &scratchCache;
+        gapSignForApplyJ = l_ssim->gapSignForPublishedNormal();
+        return true;
+    }
+
+    bool BeamContactMapping::requireFrozenJacobianCache(const char* caller) const
+    {
+        if (m_jacCacheValid)
+            return true;
+
+        msg_error() << caller
+                    << ": no frozen SSIM/BCM contact cache is available. "
+                       "apply() must establish the contact cache before "
+                       "transpose mapping is used. applyJ() intentionally "
+                       "does not publish or overwrite the frozen cache.";
+        return false;
+    }
+
+    void BeamContactMapping::publishContactDataFromCache()
+    {
+        auto triads = sofa::helper::getWriteOnlyAccessor(d_contactTriads);
+        auto dists  = sofa::helper::getWriteOnlyAccessor(d_distances);
+        const sofa::Size K = static_cast<sofa::Size>(m_jacCache.size());
+
+        triads.resize(K);
+        dists.resize(K);
+
+        for (sofa::Size k = 0; k < K; ++k)
+        {
+            const ContactJacEntry& entry = m_jacCache[k];
+            triads[k].n  = entry.normal;
+            triads[k].t1 = entry.tangent1;
+            triads[k].t2 = entry.tangent2;
+            dists[k] = Vec3(entry.gapNormal, entry.gapTangent1, entry.gapTangent2);
+        }
+        
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  apply
     //
@@ -150,8 +380,8 @@ namespace Cosserat
     //  ── Geometry ─────────────────────────────────────────────────────────────
     //
     //  Surface contact points Pc_A and Pc_B are read from SSIM:       
-    //    Pc_A = l_ssim->d_surfacePoints1[k]
-    //    Pc_B = l_ssim->d_surfacePoints2[k]
+    //    Pc_A = ContactEvaluation.surfacePoints1[k]
+    //    Pc_B = ContactEvaluation.surfacePoints2[k]
     //  SSIM already accounts for all modes (external / nested CTR, solid / hollow)
     //  and applies the correct contact-relevant radii.  BCM never recomputes them.
     //
@@ -160,7 +390,7 @@ namespace Cosserat
     //
     //  ── Contact-local frame (gap mode) ───────────────────────────────────────  
     //
-    //  Identical to SSIM d_distances convention:
+    //  Identical to SSIM ContactEvaluation distances convention:
     //    τ₁  = unit chord of Beam-1 segment [i, i+1]
     //    t̂₁ = normalize(τ₁ − (τ₁·n̂)·n̂)             (projected onto contact plane)
     //    t̂₂ = n̂ × t̂₁                                (circumferential)
@@ -221,214 +451,63 @@ namespace Cosserat
             frames1 = *dataVecIn1Pos[0];
         sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<In2VecCoord>>
             frames2 = *dataVecIn2Pos[0];
-        
-        const sofa::Size K      =  static_cast<int>(l_ssim->getNumContacts()); 
 
-        
-        if (m_jacCache.size() != K)
-            m_jacCache.resize(K);
-
-        const int N1 = static_cast<int>(frames1.size());
-        const int N2 = static_cast<int>(frames2.size());
-        const auto& params = l_ssim->d_curvilinearParams.getValue();
-        
-        constexpr Real kInvalidGap = Real(1e9);
-        
-
-        // ── Per-contact geometry ──────────────────────────────────────────────
-        //
-        // computeGeom fills m_jacCache[k] with:
-        //   - Jacobian blocks (frameIdx, weight, arm) for both beams
-        //   - contact normal    → entry.normal   (from SSIM)
-        //   - tangent t̂₁        → entry.tangent1 (from SSIM) 
-        //   - tangent t̂₂        → entry.tangent2 (from SSIM)  
-        //
-        // NOTHING is recomputed that SSIM already provides.
-        struct ContactGeom
+        const auto& from1 = this->getFromModels1();
+        const auto& from2 = this->getFromModels2();
+        const auto* vels1Data = (!from1.empty() && from1[0] && mparams)
+            ? from1[0]->read(mparams->v().getId(from1[0]))
+            : nullptr;
+        const auto* vels2Data = (!from2.empty() && from2[0] && mparams)
+            ? from2[0]->read(mparams->v().getId(from2[0]))
+            : nullptr; 
+        if (!vels1Data && !from1.empty() && from1[0])
+            vels1Data = from1[0]->read(sofa::core::vec_id::read_access::velocity);
+        if (!vels2Data && !from2.empty() && from2[0])
+            vels2Data = from2[0]->read(sofa::core::vec_id::read_access::velocity);
+        if (!vels1Data || !vels2Data)
         {
-            Vec3 Pc_A;
-            Vec3 Pc_B;
-            Vec3 n;
-            Vec2i sec;
-            Vec2d cp;
-            Vec3 ssimDistance;
-        };
+            msg_error() << "apply(): could not read input velocities for SSIM evaluation.";
+            return;
+        }
 
-        auto computeGeom = [&](sofa::Size k) -> std::pair<bool, ContactGeom>
+        const EvaluationCacheKey key =
+            makeEvaluationCacheKey(*dataVecIn1Pos[0], *dataVecIn2Pos[0],
+                                   *vels1Data, *vels2Data);
+        if (!isJacobianCacheValidFor(key))
         {
-            l_ssim->doUpdate();
-            const Vec2i sec = l_ssim->getContactSectionIds(k);
-            const int   i   = sec[0];
-            const int   j   = sec[1];
-            const Vec2d cp  = params[k];
-            const Real  alpha = cp[0];
-            const Real  beta  = cp[1];
-            
-            if (i < 0 || i + 1 >= N1 || j < 0 || j + 1 >= N2)
-            {
-                msg_error() << "Contact pair " << k << ": section index out of range "
-                    << "(i=" << i << " j=" << j
-                    << " N1=" << N1 << " N2=" << N2 << "). Skipping.";
-
-                ContactJacEntry& entry = m_jacCache[k];
-                entry.normal   = Vec3(Real(0), Real(0), Real(0));
-                entry.tangent1 = Vec3(Real(0), Real(0), Real(0));
-                entry.tangent2 = Vec3(Real(0), Real(0), Real(0));
-                entry.gapNormal   = kInvalidGap;
-                entry.gapTangent1 = Real(0);
-                entry.gapTangent2 = Real(0);
-                return { false, {} };
-            }
-            
-
-            // ── Contact identity from SSIM (frozen at step start) ───────────────
-            // n̂, t̂₁, t̂₂ remain SSIM-frozen by design (Fix A contract).
-            const Vec3 n  = l_ssim->getContactNormal(k);
-            const Vec3 t1 = l_ssim->getContactTangent1(k);
-            const Vec3 t2 = l_ssim->getContactTangent2(k);
-
-            // ── Centreline points: SSIM snapshot vs. current input frames ──────
-            const Vec3 P_A_ssim  = l_ssim->getCenterlinePoint1(k);
-            const Vec3 P_B_ssim  = l_ssim->getCenterlinePoint2(k);
-            const Vec3 Pc_A= l_ssim->getSurfacePoint1(k);
-            const Vec3 Pc_B= l_ssim->getSurfacePoint2(k);
-            
-
-            // ── Moment arms (unchanged code; now naturally consistent) ─────────
-            // arm = Pc − p_frame. Both terms come from the SAME input frames pass,
-            // so the arm is the moment arm in the current input configuration —
-            // exactly what applyJ/applyJT(MatrixDeriv) need to be J-consistent.
-            ContactJacEntry& entry = m_jacCache[k];
-            
-
-            entry.beam1Blocks[0] = { i,     Real(1) - alpha, Pc_A - P_A_ssim   };
-            entry.beam1Blocks[1] = { i + 1, alpha,           Pc_A - P_A_ssim };
-
-
-            const Vec3 p_jp1 = frames2[j + 1].getCenter();
-            entry.beam2Blocks[0] = { j,     Real(1) - beta, Pc_B - P_B_ssim   };
-            entry.beam2Blocks[1] = { j + 1, beta,           Pc_B - P_B_ssim };
-
-            entry.normal   = n;
-            entry.tangent1 = t1;
-            entry.tangent2 = t2;
-
-            return { true, { Pc_A, Pc_B, n, sec, cp, l_ssim->getDistances(k) } };
-        };
-
-        auto logGapTrace = [&](const char* mode, sofa::Size k, const ContactGeom& g)
-        {
-            if (!traceBeamContactMapping())
+            const auto eval = l_ssim->evaluateContacts(
+                *dataVecIn1Pos[0], *dataVecIn2Pos[0], *vels1Data, *vels2Data);
+            if (!rebuildJacobianCache(eval, frames1.ref(), frames2.ref()))
                 return;
+            markJacobianCacheValidFor(key);
+        }
 
-            const Real gapSign = l_ssim->gapSignForPublishedNormal();
-            const Real cpGap = gapSign * ((g.Pc_B - g.Pc_A) * g.n);
-            auto& log = bcmGapTraceLog();
-            log << "[BCM-GAP] t=" << this->getContext()->getTime()
-                << " mode=" << mode
-                << " K=" << K
-                << " k=" << k
-                << " sec=(" << g.sec[0] << "," << g.sec[1] << ")"
-                << " ab=(" << g.cp[0] << "," << g.cp[1] << ")"
-                << " gapSign=" << gapSign
-                << " ssimGap=" << g.ssimDistance[0]
-                << " cpGap=" << cpGap
-                << " diff=" << (cpGap - g.ssimDistance[0])
-                << " ssimTang=(" << g.ssimDistance[1] << "," << g.ssimDistance[2] << ")"
-                << " PcA=(" << g.Pc_A[0] << "," << g.Pc_A[1] << "," << g.Pc_A[2] << ")"
-                << " PcB=(" << g.Pc_B[0] << "," << g.Pc_B[1] << "," << g.Pc_B[2] << ")"
-                << " n=(" << g.n[0] << "," << g.n[1] << "," << g.n[2] << ")"
-                << "\n";
-            log.flush();
-        };
-        
-
+        const sofa::Size cacheK = static_cast<sofa::Size>(m_jacCache.size());
         if (isGapMode())
         {
-            // ── Gap mode: δ = Vec3(δ_n, δ_t1, δ_t2) in contact-local frame ──
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecCoord>>
                 outGap = *dataVecOutPos[0];
-            if (outGap.size() < K) outGap.resize(K);
-            for (sofa::Size k = 0; k < K; ++k)
+            if (outGap.size() < cacheK) outGap.resize(cacheK);
+            for (sofa::Size k = 0; k < cacheK; ++k)
             {
-                auto [ok, g] = computeGeom(k);
-                if (!ok) 
-                { 
-                    outGap[k] = Vec3(kInvalidGap, Real(0), Real(0));
-                    m_jacCache[k].gapNormal   = kInvalidGap;
-                    m_jacCache[k].gapTangent1 = Real(0);
-                    m_jacCache[k].gapTangent2 = Real(0);
-                    continue;
-                }
-                
-                const Vec3 d = g.ssimDistance;
-                m_jacCache[k].gapNormal   = d[0];        
-                m_jacCache[k].gapTangent1 = d[1];      
-                m_jacCache[k].gapTangent2 = d[2];      
-                logGapTrace("gap", k, g);
-                
-                outGap[k] = Vec3(
-                    m_jacCache[k].gapNormal,    
-                    m_jacCache[k].gapTangent1,
-                    m_jacCache[k].gapTangent2);
+                const ContactJacEntry& entry = m_jacCache[k];
+                outGap[k] = Vec3(entry.gapNormal,
+                                 entry.gapTangent1,
+                                 entry.gapTangent2);
             }
         }
         else
         {
-            // ── contactPoints mode: single interleaved output MO ─────────────
             sofa::helper::WriteOnlyAccessor<sofa::core::objectmodel::Data<OutVecCoord>>
                 out = *dataVecOutPos[0];
-
-            const sofa::Size newK2 = 2 * K;
+            const sofa::Size newK2 = 2 * cacheK;
             if (out.size() < newK2) out.resize(newK2);
-
-            for (sofa::Size k = 0; k < K; ++k)
+            for (sofa::Size k = 0; k < cacheK; ++k)
             {
-                auto [ok, g] = computeGeom(k);
-                if (!ok)
-                {   
-                    out[2 * k]     = Vec3(Real(0), Real(0), Real(0));
-                    out[2 * k + 1] = Vec3(Real(0), Real(0), Real(0));
-                    m_jacCache[k].gapNormal   = kInvalidGap;
-                    m_jacCache[k].gapTangent1 = Real(0);
-                    m_jacCache[k].gapTangent2 = Real(0);
-                    continue;
-                }
-                const Vec3 d = g.ssimDistance;
-                m_jacCache[k].gapNormal   = d[0];        
-                m_jacCache[k].gapTangent1 = d[1];      
-                m_jacCache[k].gapTangent2 = d[2]; 
-                logGapTrace("contactPoints", k, g);
-                out[2 * k]     = g.Pc_A;
-                out[2 * k + 1] = g.Pc_B;
+                const ContactJacEntry& entry = m_jacCache[k];
+                out[2 * k]     = entry.surfacePoint1;
+                out[2 * k + 1] = entry.surfacePoint2;
             }
-        }
-        
-        
-        auto triads = sofa::helper::getWriteOnlyAccessor(d_contactTriads);
-        auto dists  = sofa::helper::getWriteOnlyAccessor(d_distances);
-        if (triads.size() < K) triads.resize(K);  
-        if (dists.size()   < K) dists.resize(K);
-        for (sofa::Size k = 0; k < K; ++k)
-        {
-            triads[k].n  = m_jacCache[k].normal;
-            triads[k].t1 = m_jacCache[k].tangent1;
-            triads[k].t2 = m_jacCache[k].tangent2;
-
-            dists[k] = Vec3(m_jacCache[k].gapNormal,
-                            m_jacCache[k].gapTangent1,
-                            m_jacCache[k].gapTangent2);
-
-        }
-        
-        // scrub the stale tail left over from earlier steps when
-        // K_now < K_max. Keeps the vector monotonic in size (storeLambda safety)
-        // but forces the content to a state CPULC's n̂≈0 filter recognizes as
-        // "no contact here".
-        for (sofa::Size k =K; k < triads.size(); ++k)
-        {
-            triads[k] = ContactTriad{};                                  // n = t1 = t2 = 0
-            dists[k]  = Vec3(kInvalidGap, Real(0), Real(0));             // δn = +∞ → cleared
         }
     }
 
@@ -456,7 +535,23 @@ namespace Cosserat
         const sofa::type::vector<const sofa::core::objectmodel::Data<In2VecDeriv>*>&
         dataVecIn2Vel)
     {
-        
+        if (dataVecIn1Vel.empty() || dataVecIn2Vel.empty() || dataVecOutVel.empty())
+            return;
+
+        sofa::type::vector<ContactJacEntry> scratchCache;
+        const sofa::type::vector<ContactJacEntry>* jacCacheForApplyJ = nullptr;
+        Real gapSignForApplyJ = Real(1);
+        if (!rebuildJacobianCacheForApplyJ(mparams,
+                                           *dataVecIn1Vel[0],
+                                           *dataVecIn2Vel[0],
+                                           scratchCache,
+                                           jacCacheForApplyJ,
+                                           gapSignForApplyJ) ||
+            !jacCacheForApplyJ)
+        {
+            return;
+        }
+
         if (traceBeamContactMapping())
         {
             static std::ofstream bcmlog("bcm_mapping_applyJ_log.txt",
@@ -471,19 +566,16 @@ namespace Cosserat
                   << "\n";
             bcmlog.flush();
         }
-        if (dataVecIn1Vel.empty() || dataVecIn2Vel.empty() || dataVecOutVel.empty())
-            return;
 
         sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<In1VecDeriv>>
             vel1 = *dataVecIn1Vel[0];
         sofa::helper::ReadAccessor<sofa::core::objectmodel::Data<In2VecDeriv>>
             vel2 = *dataVecIn2Vel[0];
 
-        const sofa::Size  K = static_cast<int>(m_jacCache.size());
+        const auto& jacCache = *jacCacheForApplyJ;
+        const sofa::Size  K = static_cast<int>(jacCache.size());
         const bool gapMode = isGapMode();
-        l_ssim->doUpdate();
-        const Real s = l_ssim->gapSignForPublishedNormal();
-        d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
+        const Real s = gapSignForApplyJ;
         
         if (gapMode)
         {
@@ -494,7 +586,7 @@ namespace Cosserat
 
             for (sofa::Size k = 0; k < K; ++k)
             {
-                const ContactJacEntry& entry = m_jacCache[k];
+                const ContactJacEntry& entry = jacCache[k];
 
                 OutDeriv vcA{};
                 for (int b = 0; b < 2; ++b)
@@ -532,10 +624,10 @@ namespace Cosserat
                 outVel = *dataVecOutVel[0];
 
             const sofa::Size newK2 = 2 * K;
-            if (outVel.size() < newK2) outVel.resize(newK2);
+            outVel.resize(newK2);
             for (sofa::Size k = 0; k < K; ++k)
             {
-                const ContactJacEntry& entry = m_jacCache[k];
+                const ContactJacEntry& entry = jacCache[k];
 
                 OutDeriv vcA{};
                 for (int b = 0; b < 2; ++b)
@@ -592,6 +684,9 @@ namespace Cosserat
         if (dataVecInForce.empty() || dataVecOut1Force.empty() || dataVecOut2Force.empty())
             return;
 
+        if (!requireFrozenJacobianCache("applyJT(VecDeriv)"))
+            return;
+
         sofa::helper::WriteAccessor<sofa::core::objectmodel::Data<In1VecDeriv>>
             outF1 = *dataVecOut1Force[0];
         sofa::helper::WriteAccessor<sofa::core::objectmodel::Data<In2VecDeriv>>
@@ -599,9 +694,7 @@ namespace Cosserat
 
         const sofa::Size  K = static_cast<int>(m_jacCache.size());
         const bool gapMode = isGapMode();
-        l_ssim->doUpdate();
-        const Real s = l_ssim->gapSignForPublishedNormal();
-        d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
+        const Real s = d_gapSign.getValue();
 
         if (gapMode)
         {
@@ -615,7 +708,7 @@ namespace Cosserat
 
                 const ContactJacEntry& entry = m_jacCache[k];
                 
-                const Vec3 F = s * entry.normal   * inForce[k][0]
+                const Vec3 F = s * entry.normal * inForce[k][0]
                              + entry.tangent1 * inForce[k][1]
                              + entry.tangent2 * inForce[k][2];
 
@@ -725,14 +818,15 @@ namespace Cosserat
         if (dataMatIn.empty() || dataMatOut1.empty() || dataMatOut2.empty())
             return;
 
+        if (!requireFrozenJacobianCache("applyJT(MatrixDeriv)"))
+            return;
+
         sofa::helper::WriteAccessor<sofa::core::objectmodel::Data<In1MatrixDeriv>>
             outM1 = *dataMatOut1[0];
         sofa::helper::WriteAccessor<sofa::core::objectmodel::Data<In2MatrixDeriv>>
             outM2 = *dataMatOut2[0];
-        
-        l_ssim->doUpdate();
-        const Real s = l_ssim->gapSignForPublishedNormal();
-        d_gapSign.setValue(l_ssim->gapSignForPublishedNormal());
+
+        const Real s = d_gapSign.getValue();
     
         const sofa::Size  K = static_cast<int>(m_jacCache.size());
         const bool gapMode = isGapMode();
