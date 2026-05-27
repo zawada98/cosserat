@@ -335,7 +335,7 @@ class InitializationMonitor(Sofa.Core.Controller):
         print(f"              gap range             = "
               f"[{gaps.min():.3e}, {gaps.max():.3e}] m")
         print(f"              interpenetrating pairs= {n_pen}"
-              + (f"   (worst δn = {gaps.min():.3e} m)" if n_pen else ""))
+              + (f"   (worst delta_n = {gaps.min():.3e} m)" if n_pen else ""))
         print("=" * 72)
 
         # ---- Signal external listener (e.g. GUI bridge) ----

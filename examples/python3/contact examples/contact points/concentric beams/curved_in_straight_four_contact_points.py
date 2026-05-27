@@ -1009,7 +1009,7 @@ def createScene(root_node):
     root_node.addObject('RequiredPlugin', pluginName=[
         'Cosserat',                                           # DiscreteCosseratMapping, BeamHookeLawForceField,
                                                               # SphereSweptIntersectionMethod,
-                                                              # BeamContactMapping, ContactFeeder
+                                                              # BeamContactMapping, ContactPointsUnilateralConstraint
         'Sofa.Component.AnimationLoop',                       # FreeMotionAnimationLoop
         'Sofa.Component.Constraint.Lagrangian.Correction',   # UncoupledConstraintCorrection
         'Sofa.Component.Constraint.Lagrangian.Model',        # UnilateralLagrangianConstraint
@@ -1170,7 +1170,7 @@ def createScene(root_node):
         mappingMode='contactPoints'
     )
 
-    contact_output.addObject(
+    cpuc = contact_output.addObject(
         'ContactPointsUnilateralConstraint',
         name='cpuc',
         mu=0,

@@ -607,16 +607,4 @@ def createScene(root_node: Sofa.Core.Node):
         object2=contactMO.getLinkPath(),
         )
 
-    cf = contact_output.addObject(
-        'ContactFeeder',
-        name='feeder',
-        surfacePoints1=ssim.getLinkPath() + '.surfacePoints1',
-        surfacePoints2=ssim.getLinkPath() + '.surfacePoints2',
-        distances=ssim.getLinkPath() + '.distances',
-        centerlinePoints1=ssim.getLinkPath() + '.centerlinePoints1',
-        centerlinePoints2=ssim.getLinkPath() + '.centerlinePoints2',
-        constraint='@ulc',
-        alarmDistance=ALARM_DISTANCE,
-        mu=0.0,
-    )
     return root_node

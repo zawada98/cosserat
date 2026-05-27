@@ -528,7 +528,6 @@ class LiveContactMonitor(Sofa.Core.Controller):
             'cpuc',
             'cpulc',
             'ContactPointsUnilateralConstraint',
-            'ContactPointsUnilateralConstraint2',
         )
         contexts = []
         for obj in (self.contact_mo, self.bcm, self):

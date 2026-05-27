@@ -456,25 +456,11 @@ def createScene(root_node: Sofa.Core.Node):
     )
 
     contact_output.addObject(
-        'UnilateralLagrangianConstraint',
-        template='Vec3d',
-        name='ulc',
-        object1=contactMO.getLinkPath(),
-        object2=contactMO.getLinkPath(),
-    )
-
-    feeder = contact_output.addObject(
-        'ContactFeeder',
-        name='feeder',
-        distances     = bcm.getLinkPath()  + '.distances',
-        constraint='@ulc',
-        alarmDistance=ALARM_DISTANCE,
+        'ContactPointsUnilateralConstraint',
+        name='cpuc',
         mu=0,
-        contactDistance = 0,
+        activationTolerance=ALARM_DISTANCE,
         contactTriads=bcm.getLinkPath() + '.contactTriads',
         gapSign=bcm.getLinkPath() + '.gapSign',
     )
-    print("triads size:", len(feeder.contactTriads.value))
-    print("gapSign:", feeder.gapSign.value)
-    print("distances size:", len(feeder.distances.value))
     return root_node

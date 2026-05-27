@@ -73,7 +73,7 @@ CUSTOM CONTACT PIPELINE (replaces classic SOFA collision pipeline entirely)
   BVHNarrowPhase, LocalMinDistance, RuleBasedContactManager,
   LineCollisionModel, PointCollisionModel) is removed.  Contact is handled by:
 
-    SphereSweptIntersectionMethod (SSIM)  [DataEngine]
+    SphereSweptIntersectionMethod (SSIM)  [BaseObject, executed by BCM]
       For CTR internal contact: radius1 = rin_1 (inner wall of Tube_1),
       radius2 = rex_3 (outer wall of Tube_3).
       gap = rin_1 - d_centreline - rex_3
@@ -92,14 +92,9 @@ CUSTOM CONTACT PIPELINE (replaces classic SOFA collision pipeline entirely)
       input2 = Tube_3/SolverNode/Tube_3_frames/FramesMO
       out[k] = delta[k] = Pc_B[k] - Pc_A[k]
 
-    UnilateralLagrangianConstraint<Vec3d>  (ULC)
-      object1 = contactMO_ref  (fixed zero, MAX_K DOFs)
-      object2 = contactMO_gap  (BCM output)
-      Violation: dfree = delta_n_free[k]; enforces delta_n >= 0.
-
-    ContactFeeder  [BaseObject + AnimateBeginEvent]
-      Reads SSIM distances -> clear() + addContact() on ULC each step.
-      Activates pair k when distances[k][0] < ALARM_DISTANCE.
+    ContactPointsUnilateralConstraint (CPUC)
+      Reads BCM contact points, contact triads, and gap sign.
+      Activates pair k when the current gap is below ALARM_DISTANCE.
 
   Scene graph
   -----------
@@ -125,8 +120,7 @@ CUSTOM CONTACT PIPELINE (replaces classic SOFA collision pipeline entirely)
       +-- contactMO_ref  (Vec3d, MAX_K zero DOFs -- ULC object1 zero reference)
       +-- contactMO_gap  (Vec3d, K DOFs    -- BCM sole output, delta[k] = Pc_B-Pc_A)
       +-- BeamContactMapping  (bcm)  mappingMode='gap'
-      +-- UnilateralLagrangianConstraint  (ulc)
-      +-- ContactFeeder  (feeder)
+      +-- ContactPointsUnilateralConstraint  (cpuc)
 """
 
 import math
@@ -198,7 +192,7 @@ MAX_K = max(
 #   Physical wall-to-wall clearance when coaxial:
 #     gap_wall = rin_1 - rex_3 = 13.5e-4 - 4e-4 = 9.5e-4 m
 #
-# ContactFeeder activates a constraint for pair k when gap[k] < ALARM_DISTANCE.
+# CPUC activates a constraint for pair k when gap[k] < ALARM_DISTANCE.
 # Setting ALARM_DISTANCE = gap_wall + margin catches near-contact before
 # penetration: feeder activates as soon as any eccentricity consumes the gap.
 _GAP_WALL      = T1_PARAMS['rin'] - T2_PARAMS['rex']   # 9.5e-4 m
@@ -1135,7 +1129,7 @@ def createScene(root_node):
     root_node.addObject('RequiredPlugin', pluginName=[
         'Cosserat',                                           # DiscreteCosseratMapping, BeamHookeLawForceField,
                                                               # SphereSweptIntersectionMethod,
-                                                              # BeamContactMapping, ContactFeeder
+                                                              # BeamContactMapping, ContactPointsUnilateralConstraint
         'Sofa.Component.AnimationLoop',                       # FreeMotionAnimationLoop
         'Sofa.Component.Constraint.Lagrangian.Correction',   # UncoupledConstraintCorrection
         'Sofa.Component.Constraint.Lagrangian.Model',        # UnilateralLagrangianConstraint

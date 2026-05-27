@@ -1,0 +1,384 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+
+\Urlmuskip=0mu plus 2mu
+\setlength{\emergencystretch}{3em}
+\newcommand{\field}[1]{\nolinkurl{#1}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{CTR Diagnostic CSV File: Field Definitions and Computation}
+\author{}
+\date{}
+
+\begin{document}
+\sloppy
+\maketitle
+
+\section{Scope}
+
+This note documents the CSV file written by \code{CTRDiagnosticLogger} in
+\code{ctr_two_tubes_dynamic.py} and \code{ctr_two_tubes_quasi-static.py}.
+The logger is attached to the two-tube concentric-tube-robot scene and writes
+one row from \code{onAnimateEndEvent} every \code{every_n_steps} simulation
+steps. In the current scenes this sampling period is 20 steps.
+
+Tube 1, named \code{Tube_1} in the scene, is the outer tube. Tube 2 in the
+diagnostic column names is the inner tube, named \code{Tube_3} in the scene.
+The rigid pose vectors are SOFA \code{Rigid3d} states
+\([x,y,z,q_x,q_y,q_z,q_w]\). The Cosserat strain states are SOFA
+\code{Vec3d} arrays, one entry per section, and the third component
+\code{state[i][2]} is the bending curvature \(\kappa\) used by the diagnostic
+curvature fields.
+
+\section{Common Computation Rules}
+
+At construction time the logger stores the initial outer-tube base pose
+\code{t1_base_mo.position.value[0]} and the initial outer-tube frame centers
+from \code{t1_frames_mo.position.value}. All base and frame drift fields are
+computed relative to those stored values.
+
+For a Cosserat mechanical object \code{mo}, the helper
+\code{_strain_stats(mo)} reads
+\code{mo.position.value} as the current section strain vectors and
+\code{mo.rest_position.value} as the rest strain vectors. For each section
+\(i\), the strain error is
+\[
+  e_i = \left\| \mathbf{s}_i - \mathbf{s}^{rest}_i \right\|_2 .
+\]
+The reported strain errors are maxima or means of these section errors. The
+reported curvature fields are means of the third strain component,
+\(\kappa_i=s_i[2]\), over selected sections.
+
+A ``curved'' section is any selected section whose rest curvature satisfies
+\[
+  \left|s^{rest}_i[2]\right| > 10^{-12}.
+\]
+The helper \code{_curved_kappa_mean} returns the mean current curvature and
+the mean rest curvature over those curved sections. If no section is selected,
+the logger writes zero.
+
+Curvature relative-error columns are written as percentages:
+\[
+  100\,\frac{\left|\bar{\kappa}-\bar{\kappa}^{rest}\right|}
+            {\left|\bar{\kappa}^{rest}\right|}.
+\]
+If the rest-curvature denominator is below \(10^{-12}\), the logger writes
+zero to avoid division by a near-zero reference.
+
+For the inner tube exposed-region fields, the logger first computes
+\[
+  \mathrm{t2\_advance} = x_{\mathrm{t2,base}} - x_{\mathrm{t2,offset}},
+  \qquad
+  \mathrm{protrusion} =
+  \max\left(0,\mathrm{t2\_advance}-x_{\mathrm{t1,base}}\right).
+\]
+Then
+\[
+  s_{\mathrm{exposed,start}} =
+  L_{\mathrm{t2}} - \mathrm{protrusion},
+\]
+where \(L_{\mathrm{t2}}\) is \code{T2_PARAMS["str_length"]}. A section is
+considered exposed when the midpoint of its intrinsic arc-length interval,
+computed from \code{t2_sec_curv_abs}, is greater than or equal to this start
+coordinate.
+
+Contact gaps are recomputed by the logger from
+\code{BeamContactMapping.contactTriads} and the mapped contact point
+mechanical object \code{contact_mo.position}. For contact index \(k\), the
+two mapped points are read as \(q=\code{position[2*k]}\) and
+\(p=\code{position[2*k+1]}\), and the normal \(n\) is read from the
+corresponding contact triad. The signed gap is
+\[
+  g_k =
+  \code{gapSign}\, (p-q)\cdot n .
+\]
+A pair is counted as ``active-like'' when \(g_k \leq\)
+\code{activationTolerance}. This is a diagnostic contact-activity criterion,
+not a separate SOFA constraint state.
+
+The final contact-reaction columns differ slightly between the two scene
+files:
+\begin{itemize}
+  \item In \code{ctr_two_tubes_dynamic.py}, the columns are named
+  \field{active_impulse_pairs}, \field{normal_impulse_sum}, and
+  \field{normal_impulse_max}. The logger reads
+  \code{cpuc.normalContactImpulses.value}, takes absolute values, and
+  estimates forces by dividing impulse sums and maxima by \code{dt}.
+  \item In \code{ctr_two_tubes_quasi-static.py}, the corresponding columns are
+  named \field{active_lambda_pairs}, \field{normal_lambda_sum}, and
+  \field{normal_lambda_max}. The same SOFA data field is read, but in the
+  first-order quasi-static solve the stored lambda is treated as already
+  force-like, so the force columns are equal to the lambda sum and maximum.
+\end{itemize}
+
+\section{CSV Fields}
+
+\small
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.26\textwidth}
+                  >{\raggedright\arraybackslash}p{0.30\textwidth}
+                  >{\raggedright\arraybackslash}p{0.34\textwidth}}
+\toprule
+\textbf{Field} & \textbf{Meaning} & \textbf{How it is read or computed} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Field} & \textbf{Meaning} & \textbf{How it is read or computed} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\field{step} &
+Logger animation-step counter at the sampled row. &
+\code{self.step} is incremented on every \code{onAnimateEndEvent}; a row is
+written only when \code{step \% every_n_steps == 0}. \\
+
+\field{time} &
+Current SOFA simulation time in seconds. &
+Read from \code{root_node.getTime()}. \\
+
+\field{phase} &
+GUI/controller phase, for example \code{initializing} or \code{control}. &
+Read from \code{gui_bridge.snapshot()["phase"]}. \\
+
+\field{dt} &
+Current scene time step in seconds. &
+Read from \code{root_node.dt.value} with a safe float conversion. \\
+
+\field{translation_step_um} &
+Per-simulation-step translation rate limit, in micrometres per step. &
+Read from \code{gui_bridge.snapshot()["translation_step_m"]} and multiplied
+by \(10^6\). \\
+
+\field{t1_base_x} &
+Outer tube simulated rigid-base \(x\) position in metres. &
+Read as \code{t1_base_mo.position.value[0][0]}. \\
+
+\field{t1_ctrl_x} &
+Outer tube control/rest target \(x\) position in metres. &
+Read as \code{t1_control_mo.position.value[0][0]}. This is the external
+target used by the base \code{RestShapeSpringsForceField}. \\
+
+\field{t1_lag_x} &
+Outer tube axial lag between target and simulated base. &
+Computed as \code{t1_ctrl_x - t1_base_x}. \\
+
+\field{t1_base_trans_delta_m} &
+Magnitude of outer base translational drift from its initial pose, in metres. &
+Computed as the Euclidean norm of the difference between the current base
+\([x,y,z]\) and the stored initial base \([x,y,z]\). \\
+
+\field{t1_base_rot_delta_rad} &
+Outer base angular drift from its initial orientation, in radians. &
+Computed from the current and initial quaternions using
+\(2\arccos(|q\cdot q_0|)\), with the dot product clamped to \([-1,1]\). \\
+
+\field{t1_strain_err_max} &
+Maximum outer-tube section strain error. &
+Maximum of \(\|\mathbf{s}_i-\mathbf{s}^{rest}_i\|_2\) over all Tube 1
+Cosserat sections read from \code{t1_coss_mo.position} and
+\code{t1_coss_mo.rest_position}. \\
+
+\field{t1_strain_err_mean} &
+Mean outer-tube section strain error. &
+Mean of the same Tube 1 section errors used for
+\field{t1_strain_err_max}. \\
+
+\field{t1_kappa_mean_curved_1pm} &
+Mean current curvature of the curved part of the outer tube, in \(1/\mathrm{m}\). &
+Mean of \code{t1_coss_mo.position.value[i][2]} over Tube 1 sections whose
+rest curvature is nonzero. \\
+
+\field{t1_kappa_rest_mean_curved_1pm} &
+Mean rest curvature of the curved part of the outer tube, in \(1/\mathrm{m}\). &
+Mean of \code{t1_coss_mo.rest_position.value[i][2]} over the same curved Tube
+1 sections. \\
+
+\field{t1_kappa_rel_error} &
+Percentage difference between the current and rest mean curvature of the curved
+outer-tube sections. &
+Computed as
+\code{100 * abs(t1_kappa - t1_rest_kappa) / abs(t1_rest_kappa)}, with zero
+written when the rest mean curvature is too close to zero. \\
+
+\field{t1_frame_delta_max_m} &
+Maximum displacement of an outer-tube output frame from its initial center, in metres. &
+For each frame in \code{t1_frames_mo.position.value}, the logger compares the
+current \([x,y,z]\) center with the stored initial center and reports the
+maximum norm. \\
+
+\field{t1_frame_delta_mean_m} &
+Mean displacement of outer-tube output frames from their initial centers, in metres. &
+Mean of the same frame-center displacement norms used for
+\field{t1_frame_delta_max_m}. \\
+
+\field{t2_base_x} &
+Inner tube simulated rigid-base \(x\) position in metres. &
+Read as \code{t2_base_mo.position.value[0][0]}. \\
+
+\field{t2_ctrl_x} &
+Inner tube control/rest target \(x\) position in metres. &
+Read as \code{t2_control_mo.position.value[0][0]}. This is the external
+target used by the base \code{RestShapeSpringsForceField}. \\
+
+\field{t2_lag_x} &
+Inner tube axial lag between target and simulated base. &
+Computed as \code{t2_ctrl_x - t2_base_x}. \\
+
+\field{t2_advance_m} &
+Inner tube insertion measured from its initial offset, in metres. &
+Computed as \code{t2_base_x - t2_x_offset}. In the current geometry
+\code{t2_x_offset} is \(-0.16\) m from \code{compute_concentric_offset}. \\
+
+\field{estimated_protrusion_m} &
+Estimated length of inner tube protruding beyond the outer tube tip, in metres. &
+Computed as \code{max(0, t2_advance_m - t1_base_x)}. \\
+
+\field{t2_strain_err_max_all} &
+Maximum inner-tube section strain error over all sections. &
+Maximum of \(\|\mathbf{s}_i-\mathbf{s}^{rest}_i\|_2\) over all Tube 2
+Cosserat sections read from \code{t2_coss_mo.position} and
+\code{t2_coss_mo.rest_position}. \\
+
+\field{t2_strain_err_mean_all} &
+Mean inner-tube section strain error over all sections. &
+Mean of the same all-section Tube 2 strain errors used for
+\field{t2_strain_err_max_all}. \\
+
+\field{t2_strain_err_max_exposed} &
+Maximum inner-tube strain error over exposed sections only. &
+The logger first selects exposed section ids using
+\code{T2_PARAMS["str_length"] - estimated_protrusion_m} and the section
+midpoints from \code{t2_sec_curv_abs}; it then takes the maximum strain error
+over those ids. \\
+
+\field{t2_strain_err_mean_exposed} &
+Mean inner-tube strain error over exposed sections only. &
+Mean of the exposed-section Tube 2 strain errors used for
+\field{t2_strain_err_max_exposed}. \\
+
+\field{t2_kappa_mean_exposed_curved_1pm} &
+Mean current curvature of exposed, naturally curved inner-tube sections, in
+\(1/\mathrm{m}\). &
+Mean of \code{t2_coss_mo.position.value[i][2]} over exposed section ids whose
+rest curvature is nonzero. \\
+
+\field{t2_kappa_rest_mean_exposed_curved_1pm} &
+Mean rest curvature of exposed, naturally curved inner-tube sections, in
+\(1/\mathrm{m}\). &
+Mean of \code{t2_coss_mo.rest_position.value[i][2]} over the same exposed and
+curved section ids. \\
+
+\field{t2_kappa_rel_err_exposed_curved} &
+Percentage difference between the current and rest mean curvature of exposed,
+naturally curved inner-tube sections. &
+Computed as
+\code{100 * abs(exposed_kappa - exposed_rest_kappa) / abs(exposed_rest_kappa)},
+with zero written when the rest mean curvature is too close to zero. In the
+dynamic scene, the same exposed/protruded selection is stored in local variables
+named \code{protruded_*}. \\
+
+\field{t2_tip_x} &
+Inner tube tip \(x\) coordinate in metres. &
+Read from the last frame in \code{t2_frames_mo.position.value[-1][0]}; if no
+frame exists, zero is written. \\
+
+\field{t2_tip_y} &
+Inner tube tip \(y\) coordinate in metres. &
+Read from \code{t2_frames_mo.position.value[-1][1]}; if no frame exists, zero
+is written. \\
+
+\field{t2_tip_z} &
+Inner tube tip \(z\) coordinate in metres. &
+Read from \code{t2_frames_mo.position.value[-1][2]}; if no frame exists, zero
+is written. \\
+
+\field{contact_pairs} &
+Number of valid contact gaps reconstructed by the logger. &
+Counts contact triads from \code{bcm.contactTriads.value} that have a valid
+normal and a matching pair of mapped points in \code{contact_mo.position}. \\
+
+\field{active_like_pairs} &
+Number of reconstructed contact pairs whose gap is within the activation
+tolerance. &
+Counts reconstructed gaps satisfying
+\(g_k \leq \code{cpuc.activationTolerance.value}\). \\
+
+\field{min_gap} &
+Minimum reconstructed signed contact gap in metres. &
+Minimum of \(g_k=\code{gapSign}(p-q)\cdot n\) over reconstructed gaps. If no
+gap is reconstructed, zero is written. \\
+
+\field{max_gap} &
+Maximum reconstructed signed contact gap in metres. &
+Maximum of the same reconstructed gap list. If no gap is reconstructed, zero
+is written. \\
+
+\field{mean_gap} &
+Mean reconstructed signed contact gap in metres. &
+Mean of the same reconstructed gap list. If no gap is reconstructed, zero is
+written. \\
+
+\field{gap_sign} &
+Sign convention applied to contact gaps. &
+Read from \code{bcm.gapSign.value}; default fallback is \(1\) if the read
+fails. \\
+
+\field{activation_tolerance} &
+Gap threshold used by the unilateral contact constraint for activation-like
+diagnostics. &
+Read from \code{cpuc.activationTolerance.value}; in the current scene this is
+\(10^{-4}\) m. \\
+
+\field{active_impulse_pairs} / \field{active_lambda_pairs} &
+Number of stored normal contact reaction entries. &
+Length of \code{cpuc.normalContactImpulses.value}. The dynamic scene writes
+the impulse-name column; the quasi-static scene writes the lambda-name column. \\
+
+\field{normal_impulse_sum} / \field{normal_lambda_sum} &
+Sum of absolute normal contact reactions. &
+The logger converts \code{cpuc.normalContactImpulses.value} to floats, takes
+absolute values, and sums them. Dynamic rows interpret this as impulse sum;
+quasi-static rows interpret it as lambda or force-like reaction sum. \\
+
+\field{normal_impulse_max} / \field{normal_lambda_max} &
+Maximum absolute normal contact reaction. &
+Maximum absolute value in \code{cpuc.normalContactImpulses.value}. Dynamic
+rows interpret this as maximum impulse; quasi-static rows interpret it as
+maximum lambda or force-like reaction. \\
+
+\field{normal_force_sum_N} &
+Estimated total normal contact force in newtons. &
+In the dynamic scene, computed as
+\field{normal_impulse_sum}/\field{dt} when \field{dt} is positive, otherwise
+zero. In the quasi-static scene, equal to \field{normal_lambda_sum}. \\
+
+\field{normal_force_max_N} &
+Estimated maximum single-pair normal contact force in newtons. &
+In the dynamic scene, computed as
+\field{normal_impulse_max}/\field{dt} when \field{dt} is positive, otherwise
+zero. In the quasi-static scene, equal to \field{normal_lambda_max}. \\
+
+\end{longtable}
+\normalsize
+
+\section{Practical Debugging Interpretation}
+
+Large \field{t1_lag_x} or \field{t2_lag_x} means the simulated base is not
+following its spring-control target. Large \field{t1_base_trans_delta_m} or
+\field{t1_base_rot_delta_rad} during initialization means the outer tube base
+is moving even though it should be held near its initial pose.
+
+For the inner tube, compare \field{t2_strain_err_mean_exposed} and
+\field{t2_kappa_mean_exposed_curved_1pm} with
+\field{t2_kappa_rest_mean_exposed_curved_1pm}. If the exposed section errors
+stay large after protrusion, the inner tube is not relaxing toward its own
+rest curvature. Contact columns then indicate whether this correlates with
+near-active gaps or large normal reactions.
+
+\end{document}

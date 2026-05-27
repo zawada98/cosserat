@@ -7,7 +7,7 @@ Tkinter-based GUI bridge for the two-tube CTR simulation.
 ROLE IN THE PIPELINE
 --------------------
 This file is purely the *human-machine interface* layer. It owns:
-  - a tk.Tk window with sliders, knobs and an Initialize button
+  - a tk.Tk window with sliders and an Initialize button
   - a tk.Toplevel window hosting a live matplotlib plot of the contact
     profile (normal gap δn vs curvilinear abscissa of Pc_B along Tube_3)
   - a daemon thread running tkinter mainloop
@@ -29,7 +29,7 @@ The GUI therefore runs in its own daemon thread.
 Four cross-thread channels are used:
 
   GUI -> SOFA  (high-frequency, every Scale change)
-    Slider/knob commands write into self._shared under self._lock.
+    Slider commands write into self._shared under self._lock.
     CTRController.snapshot() returns a dict copy each onAnimateBeginEvent.
     Lock-protected dict access is the only safe pattern here -- direct
     attr writes on Sofa.Core.Data fields from a non-main thread can race
@@ -88,6 +88,7 @@ LIMITATIONS
     live plot Toplevel is suppressed if matplotlib import fails.
 """
 
+import math
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -129,7 +130,9 @@ class CTRGuiBridge:
                  root_node,
                  t1_max_translation_m=0.04,        # outer slider max [m]
                  t2_max_translation_m=0.08,        # inner slider max [m]
-                 max_rotation_rate_deg_per_step=2.0,   # knob max magnitude [deg/step]
+                 max_rotation_target_deg=360.0,    # rotation target slider max [deg]
+                 default_rot_step_deg=None,        # angular chase cap [deg/step]
+                 max_rotation_rate_deg_per_step=None,   # legacy name for default_rot_step_deg
                  init_dt=1e-4,                     # dt held during init phase
                  default_control_dt=1e-3,          # dt auto-applied at control entry
                  dt_min=1e-6, dt_max=1e-1,         # allowed dt range in GUI
@@ -140,7 +143,12 @@ class CTRGuiBridge:
         self._root_node               = root_node
         self._t1_max                  = float(t1_max_translation_m)
         self._t2_max                  = float(t2_max_translation_m)
-        self._max_rot_rate            = float(max_rotation_rate_deg_per_step)
+        if default_rot_step_deg is None:
+            default_rot_step_deg = (
+                2.0 if max_rotation_rate_deg_per_step is None
+                else max_rotation_rate_deg_per_step)
+        self._max_rot_target_deg      = float(max_rotation_target_deg)
+        self._default_rot_step_deg    = float(default_rot_step_deg)
         self._init_dt                 = float(init_dt)
         self._default_control_dt      = float(default_control_dt)
         self._dt_min                  = float(dt_min)
@@ -157,14 +165,12 @@ class CTRGuiBridge:
             'init_complete':            False,
             't1_translation_target_m':  0.0,
             't2_translation_target_m':  0.0,
-            # [MODIFIED] Rotation knob value is now in deg PER SIMULATION STEP,
-            # not deg/sec sim time.  Same logic as translation: per-step is
-            # the unit that gives a dt-independent real-time perception, which
-            # is what the user feels.  The previous deg/sec sim time gave
-            # ~3.6 deg/real-sec at full slider for this scene's dt = 1e-4 --
-            # easy to mistake for "rotation does not work".
-            't1_rotation_rate_deg_per_step':   0.0,
-            't2_rotation_rate_deg_per_step':   0.0,
+            # Absolute angular targets in radians. The SOFA controller chases
+            # these by at most rotation_step_rad each animation step, matching
+            # translation_step_m semantics.
+            't1_rotation_target_rad':  0.0,
+            't2_rotation_target_rad':  0.0,
+            'rotation_step_rad':       math.radians(self._default_rot_step_deg),
             'dt_request':               _NO_DT_REQUEST,
             # Live-tunable translation chase speed in *meters per simulation
             # step* (NOT m/s).
@@ -214,6 +220,13 @@ class CTRGuiBridge:
                 'protrusion_m': 0.0,
                 'dirty':        False,
             },
+            'protruded_shape_profile': {
+                'step':          0,
+                'actual_xyz':    None,
+                'natural_xyz':   None,
+                'protrusion_m':  0.0,
+                'dirty':         False,
+            },
         }
 
         # ---- GUI-thread-only state (only touched inside _run / _on_*) ----
@@ -231,8 +244,6 @@ class CTRGuiBridge:
         # Live value labels
         self._lbl_t1_tx = self._lbl_t1_rot = None
         self._lbl_t2_tx = self._lbl_t2_rot = None
-        self._rot_scales = []
-        self._rot_range_labels = []
 
         # [ADDED] Live-plot Tk Toplevel + matplotlib state (GUI-thread only)
         self._plot_window  = None
@@ -254,6 +265,12 @@ class CTRGuiBridge:
         self._curvature_ax     = None
         self._curvature_line   = None
         self._curvature_rest_line = None
+
+        self._shape_window = None
+        self._shape_canvas = None
+        self._shape_ax = None
+        self._shape_actual_line = None
+        self._shape_natural_line = None
 
         # Start the GUI thread. Daemon -> dies with the SOFA process.
         self._thread = threading.Thread(target=self._run,
@@ -365,6 +382,18 @@ class CTRGuiBridge:
                 'dirty':        True,
             }
 
+    def push_protruded_shape_profile(self, step, actual_xyz_m, natural_xyz_m,
+                                     protrusion_m):
+        """Live 3D shape of the protruded inner tube and its rest shape."""
+        with self._lock:
+            self._shared['protruded_shape_profile'] = {
+                'step':         int(step),
+                'actual_xyz':   np.asarray(actual_xyz_m, dtype=float).copy(),
+                'natural_xyz':  np.asarray(natural_xyz_m, dtype=float).copy(),
+                'protrusion_m': float(protrusion_m),
+                'dirty':        True,
+            }
+
     # ==================================================================
     #  GUI thread entry point
     # ==================================================================
@@ -393,11 +422,14 @@ class CTRGuiBridge:
                 self._build_plot_panel()
                 self._build_surface_plot_panel()
                 self._build_curvature_plot_panel()
+                self._build_protruded_shape_plot_panel()
                 self._tk_root.after(self.PLOT_POLL_INTERVAL_MS, self._poll_plot)
                 self._tk_root.after(
                     self.PLOT_POLL_INTERVAL_MS, self._poll_surface_plot)
                 self._tk_root.after(
                     self.PLOT_POLL_INTERVAL_MS, self._poll_curvature_plot)
+                self._tk_root.after(
+                    self.PLOT_POLL_INTERVAL_MS, self._poll_protruded_shape_plot)
             except Exception as e:
                 print(f"[CTRGui] Live plot setup failed: {e!r}")
 
@@ -432,30 +464,24 @@ class CTRGuiBridge:
         ext.pack(fill='x', padx=pad, pady=pad)
         self._control_frames.append(ext)
         (self._var_t1_tx, self._lbl_t1_tx,
-         self._var_t1_rot, self._lbl_t1_rot,
-         t1_rot_scale, t1_rot_range_label) = self._build_tube_panel(
+         self._var_t1_rot, self._lbl_t1_rot) = self._build_tube_panel(
             ext,
             tx_max_cm=self._t1_max * 100.0,
             on_tx=self._on_t1_tx_change,
             on_rot=self._on_t1_rot_change,
             stop_cmd=lambda: self._reset_rot('t1'))
-        self._rot_scales.append(t1_rot_scale)
-        self._rot_range_labels.append(t1_rot_range_label)
 
         # ---- Internal tube panel ----
         int_ = ttk.LabelFrame(root, text='Internal tube  (Tube_3)', padding=pad)
         int_.pack(fill='x', padx=pad, pady=pad)
         self._control_frames.append(int_)
         (self._var_t2_tx, self._lbl_t2_tx,
-         self._var_t2_rot, self._lbl_t2_rot,
-         t2_rot_scale, t2_rot_range_label) = self._build_tube_panel(
+         self._var_t2_rot, self._lbl_t2_rot) = self._build_tube_panel(
             int_,
             tx_max_cm=self._t2_max * 100.0,
             on_tx=self._on_t2_tx_change,
             on_rot=self._on_t2_rot_change,
             stop_cmd=lambda: self._reset_rot('t2'))
-        self._rot_scales.append(t2_rot_scale)
-        self._rot_range_labels.append(t2_rot_range_label)
 
         # ---- Time step & motion settings ----
         dt_frame = ttk.LabelFrame(root,
@@ -510,17 +536,17 @@ class CTRGuiBridge:
                  ).grid(row=1, column=2, columnspan=2,
                         sticky='w', padx=(pad, 0), pady=(pad, 0))
 
-        # ----- Row 2: rotation slider speed range (live) -----
-        ttk.Label(dt_frame, text='Rotation max [deg/step]:'
+        # ----- Row 2: rotation chase step (live) -----
+        ttk.Label(dt_frame, text='Rotation step [deg/step]:'
                  ).grid(row=2, column=0, sticky='w', pady=(pad, 0))
-        self._var_rot_step = tk.DoubleVar(value=self._max_rot_rate)
+        self._var_rot_step = tk.DoubleVar(value=self._default_rot_step_deg)
         rsp = ttk.Spinbox(dt_frame, textvariable=self._var_rot_step, width=12,
                          from_=0.001, to=20.0, increment=0.05,
                          command=self._on_rot_step_change)
         rsp.grid(row=2, column=1, padx=(pad, 0), pady=(pad, 0))
         rsp.bind('<Return>',   lambda _e: self._on_rot_step_change())
         rsp.bind('<FocusOut>', lambda _e: self._on_rot_step_change())
-        ttk.Label(dt_frame, text='live range for both rotation sliders'
+        ttk.Label(dt_frame, text='live angular cap for both rotation targets'
                  ).grid(row=2, column=2, columnspan=2,
                         sticky='w', padx=(pad, 0), pady=(pad, 0))
 
@@ -557,25 +583,27 @@ class CTRGuiBridge:
         lbl_tx = ttk.Label(parent, text='0.00 cm', width=14, anchor='e')
         lbl_tx.grid(row=1, column=1, padx=(pad, 0))
 
-        rot_range_label = ttk.Label(
+        ttk.Label(
             parent,
-            text=f'Rotation rate around X  '
-                 f'[{-self._max_rot_rate:+.1f} .. +{self._max_rot_rate:.1f} '
-                 f'deg/step]   (+: CW,  -: CCW)')
-        rot_range_label.grid(row=2, column=0, sticky='w', pady=(pad, 4))
+            text=f'Rotation target around X  '
+                 f'[{-self._max_rot_target_deg:+.1f} .. '
+                 f'+{self._max_rot_target_deg:.1f} deg]   '
+                 f'(+: CW,  -: CCW)').grid(
+                     row=2, column=0, sticky='w', pady=(pad, 4))
         var_rot = tk.DoubleVar(value=0.0)
         rot_scale = ttk.Scale(
-            parent, from_=-self._max_rot_rate, to=self._max_rot_rate,
+            parent, from_=-self._max_rot_target_deg,
+            to=self._max_rot_target_deg,
             orient='horizontal', length=400, variable=var_rot,
             command=on_rot)
         rot_scale.grid(row=3, column=0, sticky='ew')
-        lbl_rot = ttk.Label(parent, text='+0.00 deg/step', width=14, anchor='e')
+        lbl_rot = ttk.Label(parent, text='+0.00 deg', width=14, anchor='e')
         lbl_rot.grid(row=3, column=1, padx=(pad, 0))
 
-        ttk.Button(parent, text='Stop rotation', command=stop_cmd
+        ttk.Button(parent, text='Reset rotation', command=stop_cmd
                   ).grid(row=4, column=0, sticky='w', pady=(pad, 0))
 
-        return var_tx, lbl_tx, var_rot, lbl_rot, rot_scale, rot_range_label
+        return var_tx, lbl_tx, var_rot, lbl_rot
 
     # ==================================================================
     #  Enable / disable the control panel as a whole
@@ -626,10 +654,10 @@ class CTRGuiBridge:
         self._lbl_t1_tx.configure(text=f'{v_cm:.2f} cm')
 
     def _on_t1_rot_change(self, _=None):
-        v = float(self._var_t1_rot.get())
+        v_deg = float(self._var_t1_rot.get())
         with self._lock:
-            self._shared['t1_rotation_rate_deg_per_step'] = v
-        self._lbl_t1_rot.configure(text=f'{v:+.2f} deg/step')
+            self._shared['t1_rotation_target_rad'] = math.radians(v_deg)
+        self._lbl_t1_rot.configure(text=f'{v_deg:+.2f} deg')
 
     def _on_t2_tx_change(self, _=None):
         v_cm = float(self._var_t2_tx.get())
@@ -638,10 +666,10 @@ class CTRGuiBridge:
         self._lbl_t2_tx.configure(text=f'{v_cm:.2f} cm')
 
     def _on_t2_rot_change(self, _=None):
-        v = float(self._var_t2_rot.get())
+        v_deg = float(self._var_t2_rot.get())
         with self._lock:
-            self._shared['t2_rotation_rate_deg_per_step'] = v
-        self._lbl_t2_rot.configure(text=f'{v:+.2f} deg/step')
+            self._shared['t2_rotation_target_rad'] = math.radians(v_deg)
+        self._lbl_t2_rot.configure(text=f'{v_deg:+.2f} deg')
 
     def _reset_rot(self, which):
         if which == 't1':
@@ -702,36 +730,21 @@ class CTRGuiBridge:
             self._shared['translation_step_m'] = clamped_um * 1e-6
 
     def _on_rot_step_change(self, _=None):
-        """Live update of the rotation-slider max speed in deg/step."""
+        """Live update of the angular per-step cap in deg/step."""
         try:
-            v = float(self._var_rot_step.get())
+            v_deg = float(self._var_rot_step.get())
         except (ValueError, tk.TclError):
-            self._var_rot_step.set(self._max_rot_rate)
+            with self._lock:
+                v_rad = float(self._shared['rotation_step_rad'])
+            self._var_rot_step.set(math.degrees(v_rad))
             return
 
-        new_max = max(0.001, min(20.0, abs(v)))
-        if new_max != v:
-            self._var_rot_step.set(new_max)
+        clamped_deg = max(0.001, min(20.0, abs(v_deg)))
+        if clamped_deg != v_deg:
+            self._var_rot_step.set(clamped_deg)
 
-        self._max_rot_rate = new_max
-        for scale in self._rot_scales:
-            scale.configure(from_=-new_max, to=new_max)
-
-        label = (f'Rotation rate around X  '
-                 f'[{-new_max:+.1f} .. +{new_max:.1f} deg/step]   '
-                 f'(+: CW,  -: CCW)')
-        for range_label in self._rot_range_labels:
-            range_label.configure(text=label)
-
-        # If the user shrinks the range below the current command, clamp the
-        # command too so the controller sees a bounded per-step rotation.
-        for var, callback in ((self._var_t1_rot, self._on_t1_rot_change),
-                              (self._var_t2_rot, self._on_t2_rot_change)):
-            current = float(var.get())
-            clamped = max(-new_max, min(new_max, current))
-            if clamped != current:
-                var.set(clamped)
-            callback()
+        with self._lock:
+            self._shared['rotation_step_rad'] = math.radians(clamped_deg)
 
     # ==================================================================
     #  Polling loop  (runs on GUI thread, scheduled via root.after)
@@ -1083,3 +1096,106 @@ class CTRGuiBridge:
         finally:
             self._tk_root.after(
                 self.PLOT_POLL_INTERVAL_MS, self._poll_curvature_plot)
+
+    def _build_protruded_shape_plot_panel(self):
+        win = tk.Toplevel(self._tk_root)
+        win.title('CTR - Live protruded 3D shape')
+        win.protocol('WM_DELETE_WINDOW', win.withdraw)
+        self._shape_window = win
+
+        fig = Figure(figsize=(7.2, 6.2), dpi=100)
+        ax = fig.add_subplot(111, projection='3d')
+        (self._shape_actual_line,) = ax.plot(
+            [], [], '-o', color='#1f77b4', linewidth=1.6, markersize=3.5,
+            label='actual protruded frames')
+        (self._shape_natural_line,) = ax.plot(
+            [], [], '--', color='#d62728', linewidth=1.5,
+            label='natural precurved shape')
+        ax.set_xlabel('x [mm]')
+        ax.set_ylabel('y [mm]')
+        ax.set_zlabel('z [mm]')
+        ax.set_title('Protruded Tube_3 3D shape  (waiting for protrusion...)')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best')
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        toolbar = NavigationToolbar2Tk(canvas, win)
+        toolbar.update()
+        canvas.draw()
+
+        self._shape_canvas = canvas
+        self._shape_ax = ax
+
+    def _poll_protruded_shape_plot(self):
+        try:
+            with self._lock:
+                cp = self._shared['protruded_shape_profile']
+                if not cp['dirty']:
+                    return
+                step = cp['step']
+                actual_xyz = cp.get('actual_xyz', cp.get('actual_yz'))
+                natural_xyz = cp.get('natural_xyz', cp.get('natural_yz'))
+                protrusion_m = cp['protrusion_m']
+                cp['dirty'] = False
+
+            if actual_xyz is None or natural_xyz is None or len(actual_xyz) == 0:
+                self._shape_actual_line.set_data([], [])
+                self._shape_actual_line.set_3d_properties([])
+                self._shape_natural_line.set_data([], [])
+                self._shape_natural_line.set_3d_properties([])
+            else:
+                actual = self._as_xyz_array(actual_xyz) * 1e3
+                natural = self._as_xyz_array(natural_xyz) * 1e3
+                self._shape_actual_line.set_data(actual[:, 0], actual[:, 1])
+                self._shape_actual_line.set_3d_properties(actual[:, 2])
+                self._shape_natural_line.set_data(natural[:, 0], natural[:, 1])
+                self._shape_natural_line.set_3d_properties(natural[:, 2])
+                self._autoscale_shape_axes(actual, natural)
+
+            self._shape_ax.set_title(
+                f'Protruded Tube_3 3D shape  '
+                f'(step {step}, protrusion = {protrusion_m * 1e3:.1f} mm)')
+            self._shape_canvas.draw_idle()
+
+        except Exception as e:
+            print(f"[CTRGui] _poll_protruded_shape_plot error: {e!r}")
+
+        finally:
+            self._tk_root.after(
+                self.PLOT_POLL_INTERVAL_MS, self._poll_protruded_shape_plot)
+
+    @staticmethod
+    def _as_xyz_array(points):
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 2:
+            return np.empty((0, 3), dtype=float)
+        if points.shape[1] >= 3:
+            return points[:, :3]
+        if points.shape[1] == 2:
+            return np.c_[np.zeros(points.shape[0], dtype=float), points]
+        return np.empty((0, 3), dtype=float)
+
+    def _autoscale_shape_axes(self, actual, natural):
+        pts = np.vstack([actual, natural])
+        if pts.size == 0:
+            return
+        finite = np.all(np.isfinite(pts), axis=1)
+        pts = pts[finite]
+        if pts.size == 0:
+            return
+
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        centers = 0.5 * (mins + maxs)
+        span = float(np.max(maxs - mins))
+        half = 0.5 * max(span, 1.0)
+
+        self._shape_ax.set_xlim(centers[0] - half, centers[0] + half)
+        self._shape_ax.set_ylim(centers[1] - half, centers[1] + half)
+        self._shape_ax.set_zlim(centers[2] - half, centers[2] + half)
+        try:
+            self._shape_ax.set_box_aspect((1, 1, 1))
+        except Exception:
+            pass

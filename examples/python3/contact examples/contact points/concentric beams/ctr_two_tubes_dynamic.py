@@ -65,7 +65,7 @@ CUSTOM CONTACT PIPELINE (replaces classic SOFA collision pipeline entirely)
   BVHNarrowPhase, LocalMinDistance, RuleBasedContactManager,
   LineCollisionModel, PointCollisionModel) is removed.  Contact is handled by:
 
-    SphereSweptIntersectionMethod (SSIM)  [DataEngine]
+    SphereSweptIntersectionMethod (SSIM)  [BaseObject, executed by BCM]
       For CTR internal contact: radius1 = rin_1 (inner wall of Tube_1),
       radius2 = rex_3 (outer wall of Tube_3).
       gap = rin_1 - d_centreline - rex_3
@@ -84,14 +84,9 @@ CUSTOM CONTACT PIPELINE (replaces classic SOFA collision pipeline entirely)
       input2 = Tube_3/SolverNode/Tube_3_frames/FramesMO
       out[k] = delta[k] = Pc_B[k] - Pc_A[k]
 
-    UnilateralLagrangianConstraint<Vec3d>  (ULC)
-      object1 = contactMO_ref  (fixed zero, MAX_K DOFs)
-      object2 = contactMO_gap  (BCM output)
-      Violation: dfree = delta_n_free[k]; enforces delta_n >= 0.
-
-    ContactFeeder  [BaseObject + AnimateBeginEvent]
-      Reads SSIM distances -> clear() + addContact() on ULC each step.
-      Activates pair k when distances[k][0] < ALARM_DISTANCE.
+    ContactPointsUnilateralConstraint (CPUC)
+      Reads BCM contact points, contact triads, and gap sign.
+      Activates pair k when the current gap is below ALARM_DISTANCE.
 
   Scene graph
   -----------
@@ -117,17 +112,33 @@ CUSTOM CONTACT PIPELINE (replaces classic SOFA collision pipeline entirely)
       +-- contactMO_ref  (Vec3d, MAX_K zero DOFs -- ULC object1 zero reference)
       +-- contactMO_gap  (Vec3d, K DOFs    -- BCM sole output, delta[k] = Pc_B-Pc_A)
       +-- BeamContactMapping  (bcm)  mappingMode='gap'
-      +-- UnilateralLagrangianConstraint  (ulc)
-      +-- ContactFeeder  (feeder)
+      +-- ContactPointsUnilateralConstraint  (cpuc)
 """
 
 import math
+import os
+import sys
 import Sofa
 import Sofa.Core
 
+PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+
 from init_monitoring import InitializationMonitor
-from gui import CTRGuiBridge
 from live_monitor   import LiveContactMonitor
+from gui import CTRGuiBridge
+from protruded_shape_monitor import ProtrudedShapeMonitor
+
+MAPPING_COMPONENT = 'BeamContactMapping'
+CSV_SUFFIX = 'BCM'
+DIAG_CSV_PATH = f'ctr_two_tubes_dynamic_diagnosis_{CSV_SUFFIX}.csv'
+INIT_PNG_PATH = f'init_phase_gap_profile_{CSV_SUFFIX}.png'
+
+AUTO_TRANSLATION_TARGET_M = 0.04
+AUTO_TRANSLATION_STEP_M = 50e-6
+AUTO_ROTATION_RATE_DEG_S = 0.5
+AUTO_ROTATION_DURATION_S = 120.0
 # =============================================================================
 #  TUBE PHYSICAL PARAMETERS
 # =============================================================================
@@ -159,8 +170,8 @@ T2_PARAMS = {
     'E':             6e10,
     'v':             0.33,
     'density':       6450,
-    'nb_sections':   30,
-    'nb_frames':     30,
+    'nb_sections':   60,
+    'nb_frames':     60,
     'color':         [0.15, 0.50, 1.00, 1.0],
 }
 
@@ -190,9 +201,9 @@ MAX_K = max(
 #   Physical wall-to-wall clearance when coaxial:
 #     gap_wall = rin_1 - rex_3 = 13.5e-4 - 4e-4 = 9.5e-4 m
 #
-# ContactFeeder activates a constraint for pair k when gap[k] < ALARM_DISTANCE.
+# CPUC activates a constraint for pair k when gap[k] < ALARM_DISTANCE.
 # Setting ALARM_DISTANCE = gap_wall + margin catches near-contact before
-# penetration: feeder activates as soon as any eccentricity consumes the gap.
+# penetration: CPUC activates as soon as any eccentricity consumes the gap.
 _GAP_WALL      = T1_PARAMS['rin'] - T2_PARAMS['rex']   # 9.5e-4 m
 ALARM_DISTANCE = T2_PARAMS['rex']                   # 1.0e-3 m  (0.5 mm margin)
 STIFFNESS        = 1.0e8
@@ -825,8 +836,8 @@ def add_cosserat_tube(root_node,
     solver_node = tube_node.addChild('SolverNode')
     odesolver = solver_node.addObject('EulerImplicitSolver',
                           name='odesolver',
-                          rayleighStiffness=5e-3,
-                          rayleighMass=0.01,
+                          rayleighStiffness=0.1,
+                          rayleighMass=0,
                           firstOrder=False)
 
     solver_node.addObject('SparseLDLSolver',
@@ -923,6 +934,136 @@ def add_cosserat_tube(root_node,
 #  CONTROLLER
 # =============================================================================
 
+class AutomatedCTRBridge:
+    """Minimal no-GUI bridge used by loggers and monitors."""
+
+    def __init__(self):
+        self._phase = 'initializing'
+
+    def snapshot(self):
+        return {
+            'phase': self._phase,
+            'translation_step_m': AUTO_TRANSLATION_STEP_M,
+            't1_translation_target_m': 0.0,
+            't2_translation_target_m': AUTO_TRANSLATION_TARGET_M,
+            't1_rotation_target_rad': 0.0,
+            't2_rotation_target_rad': 0.0,
+            'rotation_step_rad': math.radians(AUTO_ROTATION_RATE_DEG_S) * CONTROL_DT,
+        }
+
+    def consume_dt_request(self):
+        return None
+
+    def signal_init_complete(self):
+        self._phase = 'control'
+        print("[AutomatedCTRBridge] initialization complete; starting automated control")
+
+    def mark_done(self):
+        self._phase = 'done'
+        print("[AutomatedCTRBridge] automated control complete")
+
+    def push_contact_profile(self, *args, **kwargs):
+        pass
+
+    def push_contact_surface_profile(self, *args, **kwargs):
+        pass
+
+    def push_curvature_profile(self, *args, **kwargs):
+        pass
+
+    def push_protruded_shape_profile(self, *args, **kwargs):
+        pass
+
+
+class AutomatedCTRController(Sofa.Core.Controller):
+    """
+    Deterministic no-GUI actuation:
+      1. Hold both base controls during initialization.
+      2. After InitializationMonitor switches to control, translate Tube_3 by
+         4 cm with the fixed per-step limiter.
+      3. Once translation reaches 4 cm, rotate Tube_3 at 0.5 deg/s for 120 s.
+    """
+
+    def __init__(self,
+                 root_node,
+                 t1_control_mo,
+                 t2_control_mo,
+                 t2_x_offset,
+                 bridge,
+                 *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.root_node = root_node
+        self.t1_control_mo = t1_control_mo
+        self.t2_control_mo = t2_control_mo
+        self.t2_x0 = float(t2_x_offset)
+        self.bridge = bridge
+        self._t1_pos_m = 0.0
+        self._t2_pos_m = 0.0
+        self._t1_angle_rad = 0.0
+        self._t2_angle_rad = 0.0
+        self._entered_control = False
+        self._rotation_start_time = None
+        self._finished = False
+
+    def onAnimateBeginEvent(self, event):
+        phase = self.bridge.snapshot().get('phase', 'initializing')
+        if phase == 'control' and not self._finished:
+            if not self._entered_control:
+                self.root_node.dt = CONTROL_DT
+                self._entered_control = True
+                print(
+                    f"[AutomatedCTRController] translating Tube_3 by "
+                    f"{AUTO_TRANSLATION_TARGET_M * 100.0:.1f} cm")
+
+            dt = float(self.root_node.dt.value)
+            if self._t2_pos_m < AUTO_TRANSLATION_TARGET_M - 1e-15:
+                self._t2_pos_m = min(
+                    AUTO_TRANSLATION_TARGET_M,
+                    self._t2_pos_m + AUTO_TRANSLATION_STEP_M)
+                if abs(self._t2_pos_m - AUTO_TRANSLATION_TARGET_M) <= 1e-15:
+                    self._rotation_start_time = float(self.root_node.getTime())
+                    print(
+                        f"[AutomatedCTRController] translation reached; rotating "
+                        f"Tube_3 at {AUTO_ROTATION_RATE_DEG_S:.3g} deg/s for "
+                        f"{AUTO_ROTATION_DURATION_S:.3g} s")
+            else:
+                if self._rotation_start_time is None:
+                    self._rotation_start_time = float(self.root_node.getTime())
+
+                elapsed = float(self.root_node.getTime()) - self._rotation_start_time
+                remaining = AUTO_ROTATION_DURATION_S - elapsed
+                if remaining > 0.0:
+                    self._t2_angle_rad += math.radians(
+                        AUTO_ROTATION_RATE_DEG_S) * min(dt, remaining)
+                else:
+                    self._finished = True
+                    self.bridge.mark_done()
+                    try:
+                        self.root_node.animate = False
+                    except Exception:
+                        pass
+
+        self._set_pose(self.t1_control_mo, self._t1_pos_m, self._t1_angle_rad,
+                       x0=0.0)
+        self._set_pose(self.t2_control_mo, self._t2_pos_m, self._t2_angle_rad,
+                       x0=self.t2_x0)
+
+    @staticmethod
+    def _set_pose(mo, tx, angle_rad, x0=0.0):
+        half = angle_rad * 0.5
+        s, c = math.sin(half), math.cos(half)
+        with mo.position.writeable() as pos:
+            p = list(pos[0])
+            p[0] = x0 + tx
+            p[1] = 0.0
+            p[2] = 0.0
+            p[3] = s
+            p[4] = 0.0
+            p[5] = 0.0
+            p[6] = c
+            pos[0] = p
+
+
 class CTRController(Sofa.Core.Controller):
     """
     GUI-driven actuation for the two-tube CTR.  The class is now a thin
@@ -957,26 +1098,20 @@ class CTRController(Sofa.Core.Controller):
                        adaptive solver.  translation_step_m is read live
                        from the GUI snapshot every step.
 
-                       Rotation knob value is the angular increment in
-                       [deg PER SIMULATION STEP] (NOT deg/sec sim time);
-                       the cumulative angle integrates as
-                            angle += radians(knob_value)
-                       every step.  Per-step is the dt-independent unit
-                       the user feels in real time.
+                       Rotation slider value is the absolute angular
+                       TARGET in [rad]; the actual base angle chases the
+                       target by at most rotation_step_rad radians PER
+                       SIMULATION STEP.
 
                        dt requests are RAMPED toward the user's target,
                        not jumped to it (an instant 10x dt jump destroys
                        the constraint solve when contacts are active --
                        see DT_RAMP_PER_STEP).
 
-    Why rate-limit translation but not rotation?
-      Translation slider value is a TARGET (absolute set-point).  Without
-      a rate limiter, dragging the slider 4 cm in one mouse motion would
-      step-jump the rigid base by 4 cm in a single dt -- a kinetic shock
-      the constraint solver cannot absorb.
-      Rotation knob value is already a per-step rate; per-step increment
-      is bounded by the GUI's Scale widget at
-      |knob_value| <= max_rotation_rate_deg_per_step.
+    Translation and rotation are both target-based and per-step limited.
+      Without a limiter, dragging a slider in one mouse motion would
+      step-jump the rigid base in a single dt -- a kinetic shock the
+      constraint solver cannot absorb.
 
     Sign conventions
     ----------------
@@ -1098,15 +1233,15 @@ class CTRController(Sofa.Core.Controller):
             self._t2_pos_m = self._step_toward(
                 self._t2_pos_m, snap['t2_translation_target_m'], max_step)
 
-            # 4) Rotation: integrate the angular-rate-per-step knob.
-            #    [MODIFIED] Knob value is now in deg/STEP (not deg/sec sim).
-            #    deg/sec sim was multiplied by dt to get deg/step, which at
-            #    dt = 1e-4 made the maximum slider produce only ~3.6 deg per
-            #    real second of sim -- visually indistinguishable from "no
-            #    rotation".  Per-step is the dt-independent unit the user
-            #    actually feels in real time, the same logic as translation_step_m.
-            self._t1_angle_rad += math.radians(snap['t1_rotation_rate_deg_per_step'])
-            self._t2_angle_rad += math.radians(snap['t2_rotation_rate_deg_per_step'])
+            # 4) Rotation: rate-limit toward the angular targets.
+            #    Same semantics as translation: the slider is an absolute
+            #    target; rotation_step_rad is the max angular change per
+            #    simulation step.
+            max_rot_step = float(snap['rotation_step_rad'])
+            self._t1_angle_rad = self._step_toward(
+                self._t1_angle_rad, snap['t1_rotation_target_rad'], max_rot_step)
+            self._t2_angle_rad = self._step_toward(
+                self._t2_angle_rad, snap['t2_rotation_target_rad'], max_rot_step)
 
         # 'initializing' (and 'waiting' if we ever get here) -> hold cumulative
         # state where it is. Write the external control points; the simulated
@@ -1207,13 +1342,13 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
             "t1_base_x,t1_ctrl_x,t1_lag_x,"
             "t1_base_trans_delta_m,t1_base_rot_delta_rad,"
             "t1_strain_err_max,t1_strain_err_mean,"
-            "t1_kappa_mean_curved_1pm,t1_kappa_rest_mean_curved_1pm,"
+            "t1_kappa_mean_curved_1pm,t1_kappa_rest_mean_curved_1pm,t1_kappa_rel_error,"
             "t1_frame_delta_max_m,t1_frame_delta_mean_m,"
             "t2_base_x,t2_ctrl_x,t2_lag_x,"
             "t2_advance_m,estimated_protrusion_m,"
             "t2_strain_err_max_all,t2_strain_err_mean_all,"
-            "t2_strain_err_max_exposed,t2_strain_err_mean_exposed,"
-            "t2_kappa_mean_exposed_curved_1pm,t2_kappa_rest_mean_exposed_curved_1pm,"
+            "t2_strain_err_max_protruded,t2_strain_err_mean_protruded,"
+            "t2_kappa_mean_protruded_curved_1pm,t2_kappa_rest_mean_protruded_curved_1pm,t2_kappa_rel_err_exposed_curved,"
             "t2_tip_x,t2_tip_y,t2_tip_z,"
             "contact_pairs,active_like_pairs,min_gap,max_gap,mean_gap,"
             "gap_sign,activation_tolerance,"
@@ -1242,6 +1377,13 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
     @staticmethod
     def _mean(values):
         return sum(values) / len(values) if values else 0.0
+
+    @staticmethod
+    def _relative_error_percent(current, reference):
+        reference = abs(float(reference))
+        if reference <= 1e-12:
+            return 0.0
+        return 100.0 * abs(float(current) - float(reference)) / reference
 
     @staticmethod
     def _norm3(v):
@@ -1326,41 +1468,26 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
 
     def _contact_stats(self):
         try:
-            triads = list(self.bcm.contactTriads.value)
-            pos = list(self.contact_mo.position.value)
+            dists = list(self.bcm.distances.value)
         except Exception:
             return 0, 0, 0.0, 0.0, 0.0
 
-        gap_sign = self._safe_float(self.bcm.gapSign.value, 1.0)
         activation = self._safe_float(self.cpuc.activationTolerance.value, 0.0)
+        invalid_gap_threshold = 1e8
         gaps = []
-        active_like = 0
 
-        for k, triad in enumerate(triads):
-            if 2 * k + 1 >= len(pos):
-                break
+        for d in dists:
             try:
-                n = triad.n
+                gap = float(d[0])
             except Exception:
-                try:
-                    n = triad[0]
-                except Exception:
-                    continue
-            if self._norm3(n) < 1e-12:
                 continue
-            q = pos[2 * k]
-            p = pos[2 * k + 1]
-            gap = gap_sign * (
-                (float(p[0]) - float(q[0])) * float(n[0]) +
-                (float(p[1]) - float(q[1])) * float(n[1]) +
-                (float(p[2]) - float(q[2])) * float(n[2])
-            )
+            if gap >= invalid_gap_threshold:
+                continue
             gaps.append(gap)
-            if gap <= activation:
-                active_like += 1
 
         if not gaps:
             return 0, 0, 0.0, 0.0, 0.0
+        active_like = sum(1 for gap in gaps if gap <= activation)
         return len(gaps), active_like, min(gaps), max(gaps), self._mean(gaps)
 
     def onAnimateEndEvent(self, event):
@@ -1385,6 +1512,7 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
             self._strain_stats(self.t1_coss_mo)
         )
         t1_kappa, t1_rest_kappa = self._curved_kappa_mean(t1_strains, t1_rests)
+        t1_kappa_rel_error = self._relative_error_percent(t1_kappa, t1_rest_kappa)
         t1_base_trans_delta, t1_base_rot_delta = self._t1_base_delta()
         t1_frame_delta_max, t1_frame_delta_mean = self._t1_frame_delta_stats()
 
@@ -1392,16 +1520,19 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
             self._strain_stats(self.t2_coss_mo)
         )
 
-        exposed_start_s = T2_PARAMS["str_length"] - protrusion
-        exposed_ids = []
+        protruded_start_s = T2_PARAMS["str_length"] - protrusion
+        protruded_ids = []
         for i in range(min(len(strain_err), len(self.t2_sec_curv_abs) - 1)):
             s_mid = 0.5 * (self.t2_sec_curv_abs[i] + self.t2_sec_curv_abs[i + 1])
-            if s_mid >= exposed_start_s:
-                exposed_ids.append(i)
+            if s_mid >= protruded_start_s:
+                protruded_ids.append(i)
 
-        exposed_err = [strain_err[i] for i in exposed_ids]
-        exposed_kappa, exposed_rest_kappa = self._curved_kappa_mean(
-            strains, rests, exposed_ids
+        protruded_err = [strain_err[i] for i in protruded_ids]
+        protruded_kappa, protruded_rest_kappa = self._curved_kappa_mean(
+            strains, rests, protruded_ids
+        )
+        protruded_kappa_rel_error = self._relative_error_percent(
+            protruded_kappa, protruded_rest_kappa
         )
 
         frames = list(self.t2_frames_mo.position.value)
@@ -1419,13 +1550,13 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
             f"{t1_base_x:.9g},{t1_ctrl_x:.9g},{(t1_ctrl_x - t1_base_x):.9g},"
             f"{t1_base_trans_delta:.9g},{t1_base_rot_delta:.9g},"
             f"{(max(t1_strain_err) if t1_strain_err else 0.0):.9g},{self._mean(t1_strain_err):.9g},"
-            f"{t1_kappa:.9g},{t1_rest_kappa:.9g},"
+            f"{t1_kappa:.9g},{t1_rest_kappa:.9g},{t1_kappa_rel_error:.9g},"
             f"{t1_frame_delta_max:.9g},{t1_frame_delta_mean:.9g},"
             f"{t2_base_x:.9g},{t2_ctrl_x:.9g},{(t2_ctrl_x - t2_base_x):.9g},"
             f"{t2_advance:.9g},{protrusion:.9g},"
             f"{(max(strain_err) if strain_err else 0.0):.9g},{self._mean(strain_err):.9g},"
-            f"{(max(exposed_err) if exposed_err else 0.0):.9g},{self._mean(exposed_err):.9g},"
-            f"{exposed_kappa:.9g},{exposed_rest_kappa:.9g},"
+            f"{(max(protruded_err) if protruded_err else 0.0):.9g},{self._mean(protruded_err):.9g},"
+            f"{protruded_kappa:.9g},{protruded_rest_kappa:.9g},{protruded_kappa_rel_error:.9g},"
             f"{float(tip[0]):.9g},{float(tip[1]):.9g},{float(tip[2]):.9g},"
             f"{contact_pairs},{active_like},{min_gap:.9g},{max_gap:.9g},{mean_gap:.9g},"
             f"{gap_sign:.9g},{activation:.9g},"
@@ -1434,7 +1565,7 @@ class CTRDiagnosticLogger(Sofa.Core.Controller):
         )
 
 
-class ExposedCurvatureMonitor(Sofa.Core.Controller):
+class protrudedCurvatureMonitor(Sofa.Core.Controller):
     """Push live curvature of only the protruded Tube_3 sections to the GUI."""
 
     def __init__(self,
@@ -1471,7 +1602,7 @@ class ExposedCurvatureMonitor(Sofa.Core.Controller):
         strains = list(self.t2_coss_mo.position.value)
         rests = list(self.t2_coss_mo.rest_position.value)
         n = min(len(strains), len(rests), len(self.t2_sec_curv_abs) - 1)
-        exposed_start_s = T2_PARAMS["str_length"] - protrusion
+        protruded_start_s = T2_PARAMS["str_length"] - protrusion
 
         s_mid = []
         kappa = []
@@ -1479,7 +1610,7 @@ class ExposedCurvatureMonitor(Sofa.Core.Controller):
         for i in range(n):
             sm = 0.5 * (self.t2_sec_curv_abs[i] +
                         self.t2_sec_curv_abs[i + 1])
-            if sm >= exposed_start_s:
+            if sm >= protruded_start_s:
                 s_mid.append(sm)
                 kappa.append(float(strains[i][2]))
                 kappa_rest.append(float(rests[i][2]))
@@ -1503,7 +1634,7 @@ def createScene(root_node):
     root_node.addObject('RequiredPlugin', pluginName=[
         'Cosserat',                                           # DiscreteCosseratMapping, BeamHookeLawForceField,
                                                               # SphereSweptIntersectionMethod,
-                                                              # BeamContactMapping, ContactFeeder
+                                                              # BeamContactMapping, ContactPointsUnilateralConstraint
         'Sofa.Component.AnimationLoop',                       # FreeMotionAnimationLoop
         'Sofa.Component.Constraint.Lagrangian.Correction',
         'Sofa.Component.Constraint.Lagrangian.Model',        # UnilateralLagrangianConstraint
@@ -1600,7 +1731,8 @@ def createScene(root_node):
         root_node=root_node,
         t1_max_translation_m=0.04,                  # outer tube slider: 0..4 cm
         t2_max_translation_m=0.18,                  # inner tube slider: 0..8 cm
-        max_rotation_rate_deg_per_step=0.5,         # knob: -2..+2 deg/STEP
+        max_rotation_target_deg=360.0,              # rotation target sliders: -360..+360 deg
+        default_rot_step_deg=0.5,                   # angular chase cap [deg/step]
         init_dt=INIT_DT,                            # init phase dt (matches root_node.dt above)
         default_control_dt=CONTROL_DT,              # GUI Spinbox suggested value (NOT auto-applied)
         dt_min=1e-9, dt_max=1e-1,                   # allowed range in the Spinbox
@@ -1662,9 +1794,9 @@ def createScene(root_node):
     )
 
     cpuc = contact_output.addObject(
-        'ContactPointsUnilateralConstraint2',
+        'ContactPointsUnilateralConstraint',
         name='cpuc',
-        mu=0,
+        mu=0.2,
         contactTriads=bcm.getLinkPath() + '.contactTriads',
         gapSign=bcm.getLinkPath() + '.gapSign',
         activationTolerance = 1e-4,
@@ -1695,17 +1827,31 @@ def createScene(root_node):
         bcm=bcm,
         cpuc=cpuc,
         t2_x_offset=x_t3,
-        path='ctr_two_tube_spring_driven_diag.csv',
+        path='ctr_two_tube_dynamic_diagnosis.csv',
         every_n_steps=20,
     ))
 
-    intersection_node.addObject(ExposedCurvatureMonitor(
-        name='ExposedCurvatureMonitor',
+    intersection_node.addObject(protrudedCurvatureMonitor(
+        name='protrudedCurvatureMonitor',
         gui_bridge=gui_bridge,
         t1_base_mo=t1_base_mo,
         t2_base_mo=t2_base_mo,
         t2_coss_mo=t2_coss_mo,
         t2_sec_curv_abs=t2_sec_curv_abs,
+        t2_x_offset=x_t3,
+        every_n_steps=20,
+    ))
+
+    intersection_node.addObject(ProtrudedShapeMonitor(
+        name='ProtrudedShapeMonitor',
+        gui_bridge=gui_bridge,
+        t1_base_mo=t1_base_mo,
+        t2_base_mo=t2_base_mo,
+        t2_frames_mo=t2_MO,
+        t2_coss_mo=t2_coss_mo,
+        t2_frame_curv_abs=t2_curv_abs_frames,
+        t2_sec_curv_abs=t2_sec_curv_abs,
+        t2_length=T2_PARAMS['str_length'],
         t2_x_offset=x_t3,
         every_n_steps=20,
     ))
