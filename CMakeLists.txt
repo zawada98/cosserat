@@ -53,9 +53,7 @@ set(HEADER_FILES
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.h
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.inl
     ${SRC_ROOT_DIR}/constraint/ContactPointsUnilateralConstraint.h
-    ${SRC_ROOT_DIR}/constraint/ContactPointsUnilateralConstraint2.h
     ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.h 
-    ${SRC_ROOT_DIR}/intersection/ContactFeeder.h
     )
 set(SOURCE_FILES
     ${SRC_ROOT_DIR}/initCosserat.cpp
@@ -74,9 +72,7 @@ set(SOURCE_FILES
     ${SRC_ROOT_DIR}/mapping/LegendrePolynomialsMapping.cpp
     ${SRC_ROOT_DIR}/constraint/CosseratNeedleSlidingConstraint.cpp
     ${SRC_ROOT_DIR}/constraint/ContactPointsUnilateralConstraint.cpp
-    ${SRC_ROOT_DIR}/constraint/ContactPointsUnilateralConstraint2.cpp
     ${SRC_ROOT_DIR}/intersection/SphereSweptIntersectionMethod.cpp 
-    ${SRC_ROOT_DIR}/intersection/ContactFeeder.cpp
     )
 
 
